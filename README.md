@@ -27,7 +27,9 @@ Defaults are tuned for throughput:
 - NVFP4 block‑scaled GEMM (sm120a)
 - all GPUs by default
 - `gpu_workers=32` (best total throughput on the current setup)
-- `pop=2048, batch=32, seq=64, hidden=128, layers=4`
+- `pop=2048, batch=32, seq=64, hidden=512, layers=4, mlp_mult=2`
+- NVFP4 defaults: split‑K decomp, splits=2, autotune off
+- CUDA graph capture off, fused EFLA step off
 
 ## Notes
 - NVFP4 requires SM120a+ and hidden size divisible by 128; the binary will abort if misaligned.

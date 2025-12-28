@@ -36,6 +36,16 @@ __device__ __forceinline__ float sigmoid(float x) {
     return 1.0f / (1.0f + expf(-x));
 }
 
+inline void select_efla_tiles(int hidden, int* tile_n, int* tile_d) {
+    if (hidden >= 512) {
+        *tile_n = 128;
+        *tile_d = 64;
+    } else {
+        *tile_n = 64;
+        *tile_d = 32;
+    }
+}
+
 __device__ __forceinline__ uint64_t splitmix64_next(uint64_t& state) {
     uint64_t z = (state += 0x9e3779b97f4a7c15ULL);
     z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
@@ -1959,8 +1969,9 @@ void efla_step(float* d_S,
         d_q, d_k, d_beta_raw, beta_bias, hidden, method, eps, d_q_norm, d_k_usage, d_alpha);
 
     cudaMemsetAsync(d_kS, 0, static_cast<size_t>(batch) * hidden * sizeof(float), stream);
-    const int tile_n = 64;
-    const int tile_d = 32;
+    int tile_n = 64;
+    int tile_d = 32;
+    select_efla_tiles(hidden, &tile_n, &tile_d);
     dim3 block_k(tile_n, 1, 1);
     dim3 grid_k(batch, (hidden + tile_n - 1) / tile_n, (hidden + tile_d - 1) / tile_d);
     efla_kS_kernel<<<grid_k, block_k, 0, stream>>>(d_S, d_k_usage, hidden, tile_d, d_kS);
@@ -2014,8 +2025,9 @@ void efla_step_half(__half* d_S,
             d_q, d_k, d_beta_raw, beta_bias, hidden, method, eps, d_q_norm, d_k_usage, d_alpha);
     }
 
-    const int tile_n = 64;
-    const int tile_d = 32;
+    int tile_n = 64;
+    int tile_d = 32;
+    select_efla_tiles(hidden, &tile_n, &tile_d);
     const bool use_full = ((hidden & 1) == 0) && (hidden <= 256);
     if (use_full) {
         dim3 block_k(tile_n / 2, 1, 1);

@@ -792,6 +792,112 @@ __global__ void gemm_f_noise_kernel(const int8_t* __restrict__ x,
     }
 }
 
+__global__ void head_gemm_cross_entropy_kernel(const int8_t* __restrict__ x,
+                                               const int8_t* __restrict__ w,
+                                               const int8_t* __restrict__ w_noise,
+                                               const float* __restrict__ scale_x,
+                                               int cols,
+                                               int vocab,
+                                               float out_scale,
+                                               float noise_scale,
+                                               const float* __restrict__ bias,
+                                               const float* __restrict__ bias_noise,
+                                               float bias_noise_scale,
+                                               const uint8_t* __restrict__ targets_t,
+                                               int token_stride,
+                                               float* __restrict__ loss_accum) {
+    const int b = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    extern __shared__ unsigned char shmem_head[];
+    size_t offset = 0;
+    offset = (offset + 3) & ~static_cast<size_t>(3);
+    int8_t* sh_x = reinterpret_cast<int8_t*>(shmem_head + offset);
+    offset += static_cast<size_t>(cols) * sizeof(int8_t);
+    offset = (offset + sizeof(float) - 1) & ~(sizeof(float) - 1);
+    float* shmax = reinterpret_cast<float*>(shmem_head + offset);
+    float* shsum = shmax + blockDim.x;
+
+    __shared__ float sh_vy;
+    __shared__ int sh_y;
+    if (tid == 0) {
+        sh_y = static_cast<int>(targets_t[b * token_stride]);
+    }
+    __syncthreads();
+
+    const int8_t* xrow = x + b * cols;
+    for (int j = tid; j < cols; j += blockDim.x) {
+        sh_x[j] = xrow[j];
+    }
+    __syncthreads();
+
+    float logit = -INFINITY;
+    if (tid < vocab) {
+        const int8_t* wrow = w + tid * cols;
+        const int8_t* wrow_n = (w_noise && noise_scale != 0.0f) ? (w_noise + tid * cols) : nullptr;
+        float acc = 0.0f;
+        float acc_n = 0.0f;
+        for (int j0 = 0; j0 < cols; j0 += 256) {
+            const int j_end = (j0 + 256 < cols) ? (j0 + 256) : cols;
+            int32_t sum = 0;
+            int32_t sum_n = 0;
+            int j = j0;
+            for (; j + 4 <= j_end; j += 4) {
+                const int x4 = *reinterpret_cast<const int*>(sh_x + j);
+                const int w4 = *reinterpret_cast<const int*>(wrow + j);
+                sum = dp4a(x4, w4, sum);
+                if (wrow_n) {
+                    const int wn4 = *reinterpret_cast<const int*>(wrow_n + j);
+                    sum_n = dp4a(x4, wn4, sum_n);
+                }
+            }
+            for (; j < j_end; ++j) {
+                const int32_t xv = static_cast<int32_t>(sh_x[j]);
+                sum += xv * static_cast<int32_t>(wrow[j]);
+                if (wrow_n) {
+                    sum_n += xv * static_cast<int32_t>(wrow_n[j]);
+                }
+            }
+            const float scale = scale_x[j0 / 256];
+            acc += scale * static_cast<float>(sum);
+            if (wrow_n) {
+                acc_n += scale * static_cast<float>(sum_n);
+            }
+        }
+        logit = (acc + noise_scale * acc_n) * out_scale;
+        if (bias) logit += bias[tid];
+        if (bias_noise) logit += bias_noise_scale * bias_noise[tid];
+        if (tid == sh_y) {
+            sh_vy = logit;
+        }
+    }
+
+    shmax[tid] = (tid < vocab) ? logit : -INFINITY;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shmax[tid] = fmaxf(shmax[tid], shmax[tid + stride]);
+        }
+        __syncthreads();
+    }
+
+    const float maxv = shmax[0];
+    float local_sum = (tid < vocab) ? expf(logit - maxv) : 0.0f;
+    shsum[tid] = local_sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shsum[tid] += shsum[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        const float logprob = sh_vy - maxv - logf(shsum[0] + 1e-9f);
+        atomicAdd(loss_accum, -logprob);
+    }
+}
+
 __global__ void gemm_gelu_q_kernel(const int8_t* __restrict__ x,
                                   const int8_t* __restrict__ w,
                                   const int8_t* __restrict__ w_noise,
@@ -2977,6 +3083,34 @@ void gemm_ternary_f(const int8_t* d_x, const int8_t* d_w,
                                                   out_scale,
                                                   cols, rows, batch,
                                                   d_out);
+}
+
+void head_gemm_cross_entropy(const int8_t* d_x,
+                             const int8_t* d_w,
+                             const int8_t* d_w_noise,
+                             const float* d_scale_x,
+                             int cols,
+                             int vocab,
+                             int batch,
+                             float out_scale,
+                             float noise_scale,
+                             const float* d_bias,
+                             const float* d_bias_noise,
+                             float bias_noise_scale,
+                             const uint8_t* d_targets_t,
+                             int token_stride,
+                             float* d_loss_accum,
+                             cudaStream_t stream) {
+    const int threads = 256;
+    const int blocks = batch;
+    size_t shmem = 0;
+    shmem = (shmem + 3) & ~static_cast<size_t>(3);
+    shmem += static_cast<size_t>(cols) * sizeof(int8_t);
+    shmem = (shmem + sizeof(float) - 1) & ~(sizeof(float) - 1);
+    shmem += static_cast<size_t>(threads) * 2 * sizeof(float);
+    head_gemm_cross_entropy_kernel<<<blocks, threads, shmem, stream>>>(
+        d_x, d_w, d_w_noise, d_scale_x, cols, vocab, out_scale, noise_scale,
+        d_bias, d_bias_noise, bias_noise_scale, d_targets_t, token_stride, d_loss_accum);
 }
 
 void gemm_ternary_f_noise(const int8_t* d_x, const int8_t* d_w,

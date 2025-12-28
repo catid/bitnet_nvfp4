@@ -72,6 +72,25 @@ void gemm_ternary_f(const int8_t* d_x, const int8_t* d_w,
                     float* d_out,
                     cudaStream_t stream);
 
+// Fused head GEMM + cross-entropy loss (vocab <= 256, dp4a path).
+// Computes loss over a single token step and accumulates into d_loss_accum.
+void head_gemm_cross_entropy(const int8_t* d_x,
+                             const int8_t* d_w,
+                             const int8_t* d_w_noise,
+                             const float* d_scale_x,
+                             int cols,
+                             int vocab,
+                             int batch,
+                             float out_scale,
+                             float noise_scale,
+                             const float* d_bias,
+                             const float* d_bias_noise,
+                             float bias_noise_scale,
+                             const uint8_t* d_targets_t,
+                             int token_stride,
+                             float* d_loss_accum,
+                             cudaStream_t stream);
+
 // GEMM to float with fused noise add (full-matrix noise).
 // out[b, i] = out_scale * (sum_j x*w + noise_scale*sum_j x*w_noise)
 void gemm_ternary_f_noise(const int8_t* d_x, const int8_t* d_w,

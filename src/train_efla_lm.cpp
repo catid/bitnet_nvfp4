@@ -192,9 +192,9 @@ struct TrainConfig {
     int population = 2048; // even
     int batch = 32;
     int seq_len = 64;
-    int hidden = 128;
+    int hidden = 512;
     int layers = 4;
-    int mlp_mult = 4;
+    int mlp_mult = 2;
     int vocab = 256;
     int sigma_shift = 3;
     int sigma_shift_end = -1;
@@ -204,7 +204,7 @@ struct TrainConfig {
     int clt_k = 4;             // number of ternary draws to sum
     bool use_gpu_noise = true;
     bool use_gpu_update = true;
-    bool use_cuda_graph = true;
+    bool use_cuda_graph = false;
     bool graph_full_eval = true;
     bool use_nvtx = false;
     bool use_fused_qkv = true;
@@ -212,8 +212,9 @@ struct TrainConfig {
     int qkv_split_vec4 = -1; // -1 = auto, 0 = off, 1 = on
     bool use_qkv_split_bias = false;
     bool use_fused_ff1 = true;
+    bool use_fused_head_loss = false;
     bool use_fused_noise_gemm = true;
-    bool use_fused_efla = true;
+    bool use_fused_efla = false;
     bool use_efla_mixed = false;
     bool use_efla_fuse_diff = false;
     bool use_efla_update_wmma = false;
@@ -263,14 +264,14 @@ struct TrainConfig {
     bitnet_cuda::Nvfp4Schedule nvfp4_schedule = bitnet_cuda::Nvfp4Schedule::Auto;
     bitnet_cuda::Nvfp4QuantMode nvfp4_quant_mode = bitnet_cuda::Nvfp4QuantMode::Warp16;
     bitnet_cuda::Nvfp4StageCount nvfp4_stage_count = bitnet_cuda::Nvfp4StageCount::Auto;
-    bitnet_cuda::Nvfp4Decomposition nvfp4_decomp = bitnet_cuda::Nvfp4Decomposition::Heuristic;
-    int nvfp4_splits = 1;
-    bool nvfp4_autotune = true;
-    bool nvfp4_tune_schedule = true;
-    bool nvfp4_tune_quant = true;
-    bool nvfp4_tune_stages = true;
-    bool nvfp4_tune_decomp = true;
-    bool nvfp4_tune_splits = true;
+    bitnet_cuda::Nvfp4Decomposition nvfp4_decomp = bitnet_cuda::Nvfp4Decomposition::SplitK;
+    int nvfp4_splits = 2;
+    bool nvfp4_autotune = false;
+    bool nvfp4_tune_schedule = false;
+    bool nvfp4_tune_quant = false;
+    bool nvfp4_tune_stages = false;
+    bool nvfp4_tune_decomp = false;
+    bool nvfp4_tune_splits = false;
 
     enum class Schedule { Constant = 0, Linear = 1, Cosine = 2, Exp = 3 };
     Schedule lr_schedule = Schedule::Cosine;
@@ -653,7 +654,7 @@ public:
                int state_dim, bool state_fp16, bool use_cuda_graph, bool graph_full_eval, bool use_nvtx,
                bool use_fused_qkv, bool use_qkv_split_kernel, int qkv_split_vec4,
                bool use_qkv_split_bias,
-               bool use_fused_ff1, bool use_fused_noise_gemm,
+               bool use_fused_ff1, bool use_fused_head_loss, bool use_fused_noise_gemm,
                bool use_fused_efla, bool use_efla_mixed, bool use_efla_fuse_diff, bool use_efla_update_wmma,
                bool use_tiled_gemm, bool use_packed_gemm,
                bool use_packed_gemm_bitnet,
@@ -688,6 +689,7 @@ public:
           use_qkv_split_vec4_(qkv_split_vec4 < 0 ? (hidden <= 256) : (qkv_split_vec4 != 0)),
           use_qkv_split_bias_(use_qkv_split_bias),
           use_fused_ff1_(use_fused_ff1),
+          use_fused_head_loss_(use_fused_head_loss),
           use_fused_noise_gemm_(use_fused_noise_gemm),
           use_fused_efla_(use_fused_efla),
           use_efla_mixed_(use_efla_mixed),
@@ -2123,6 +2125,11 @@ public:
         const bool use_transformer_residual = (L_ >= 2);
         const bool noise_active = (noise_scale != 0.0f);
         const bool capture_loss = use_cuda_graph_ && graph_full_eval_;
+        const bool fused_head_loss =
+            use_fused_head_loss_ &&
+            !use_packed_gemm_ &&
+            (gemm_backend_ == TrainConfig::GemmBackend::Dp4a) &&
+            (V_ <= 256);
 
         auto efla_full_state = [&](float* d_S_f, __half* d_S_h, float beta_bias_eff, float* d_out) {
             if (use_fused_efla_) {
@@ -3200,26 +3207,47 @@ public:
                 }
 
                 NvtxRange range_head(use_nvtx_ && !use_cuda_graph_, "head");
-                float* d_logits_t = d_logits_ + static_cast<size_t>(t) * B_ * V_;
-                gemm_noisy(x_final, d_head_, d_head_noise_,
-                           use_packed_gemm_ ? d_head_packed_ : nullptr,
-                           use_packed_gemm_ ? d_head_noise_packed_ : nullptr,
-                           d_scale_x_,
-                           d_head_nvfp4_, d_head_sfb_,
-                           d_head_noise_nvfp4_, d_head_noise_sfb_,
-                           V_, H_,
-                           head_out_scale_,
-                           d_logits_t);
-                efla_lm_cuda::cross_entropy_loss(d_logits_t,
-                                                 d_bias,
-                                                 d_bias_noise,
-                                                 bias_noise_scale,
-                                                 d_targets_active_ + t,
-                                                 T_,
-                                                 V_,
-                                                 B_,
-                                                 d_loss_sum_,
-                                                 stream_);
+                if (fused_head_loss) {
+                    const float fused_noise = noise_active ? static_cast<float>(anti_sign) * noise_scale : 0.0f;
+                    const int8_t* head_noise = noise_active ? d_head_noise_ : nullptr;
+                    bitnet_cuda::head_gemm_cross_entropy(x_final,
+                                                         d_head_,
+                                                         head_noise,
+                                                         d_scale_x_,
+                                                         H_,
+                                                         V_,
+                                                         B_,
+                                                         head_out_scale_,
+                                                         fused_noise,
+                                                         d_bias,
+                                                         d_bias_noise,
+                                                         bias_noise_scale,
+                                                         d_targets_active_ + t,
+                                                         T_,
+                                                         d_loss_sum_,
+                                                         stream_);
+                } else {
+                    float* d_logits_t = d_logits_ + static_cast<size_t>(t) * B_ * V_;
+                    gemm_noisy(x_final, d_head_, d_head_noise_,
+                               use_packed_gemm_ ? d_head_packed_ : nullptr,
+                               use_packed_gemm_ ? d_head_noise_packed_ : nullptr,
+                               d_scale_x_,
+                               d_head_nvfp4_, d_head_sfb_,
+                               d_head_noise_nvfp4_, d_head_noise_sfb_,
+                               V_, H_,
+                               head_out_scale_,
+                               d_logits_t);
+                    efla_lm_cuda::cross_entropy_loss(d_logits_t,
+                                                     d_bias,
+                                                     d_bias_noise,
+                                                     bias_noise_scale,
+                                                     d_targets_active_ + t,
+                                                     T_,
+                                                     V_,
+                                                     B_,
+                                                     d_loss_sum_,
+                                                     stream_);
+                }
             }
             if (capture_loss) {
                 cuda_check(cudaMemcpyAsync(h_loss_sum_pinned_, d_loss_sum_, sizeof(float),
@@ -3248,6 +3276,7 @@ public:
             key.efla_mixed = use_efla_mixed_;
             key.efla_fuse_diff = use_efla_fuse_diff_;
             key.efla_update_wmma = use_efla_update_wmma_;
+            key.fused_head_loss = fused_head_loss;
             key.act_scale = act_scale;
             key.mlp_act_scale = mlp_act_scale;
             key.ln_scale = ln_scale;
@@ -3469,6 +3498,7 @@ private:
         bool efla_mixed = false;
         bool efla_fuse_diff = false;
         bool efla_update_wmma = false;
+        bool fused_head_loss = false;
         float act_scale = 0.0f;
         float mlp_act_scale = 0.0f;
         float ln_scale = 0.0f;
@@ -3493,6 +3523,7 @@ private:
     bool use_qkv_split_vec4_ = true;
     bool use_qkv_split_bias_ = false;
     bool use_fused_ff1_ = true;
+    bool use_fused_head_loss_ = false;
     bool use_fused_noise_gemm_ = true;
     bool use_fused_efla_ = false;
     bool use_efla_mixed_ = false;
@@ -3612,6 +3643,7 @@ private:
                a.efla_mixed == b.efla_mixed &&
                a.efla_fuse_diff == b.efla_fuse_diff &&
                a.efla_update_wmma == b.efla_update_wmma &&
+               a.fused_head_loss == b.fused_head_loss &&
                a.act_scale == b.act_scale &&
                a.mlp_act_scale == b.mlp_act_scale &&
                a.ln_scale == b.ln_scale &&
@@ -4218,6 +4250,9 @@ int main(int argc, char** argv) {
     bool nvfp4_stage_specified = false;
     bool nvfp4_decomp_specified = false;
     bool nvfp4_splits_specified = false;
+    bool nvfp4_autotune_specified = false;
+    bool cuda_graph_specified = false;
+    bool efla_fused_specified = false;
     bool lr_schedule_specified = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -4263,8 +4298,8 @@ int main(int argc, char** argv) {
         else if (a == "--no_gpu_noise") cfg.use_gpu_noise = false;
         else if (a == "--gpu_update") cfg.use_gpu_update = true;
         else if (a == "--no_gpu_update") cfg.use_gpu_update = false;
-        else if (a == "--cuda_graph") cfg.use_cuda_graph = true;
-        else if (a == "--no_cuda_graph") cfg.use_cuda_graph = false;
+        else if (a == "--cuda_graph") { cfg.use_cuda_graph = true; cuda_graph_specified = true; }
+        else if (a == "--no_cuda_graph") { cfg.use_cuda_graph = false; cuda_graph_specified = true; }
         else if (a == "--graph_full_eval") cfg.graph_full_eval = true;
         else if (a == "--no_graph_full_eval") cfg.graph_full_eval = false;
         else if (a == "--nvtx") cfg.use_nvtx = true;
@@ -4280,6 +4315,8 @@ int main(int argc, char** argv) {
         else if (a == "--no_qkv_split_bias") cfg.use_qkv_split_bias = false;
         else if (a == "--fused_ff1") cfg.use_fused_ff1 = true;
         else if (a == "--no_fused_ff1") cfg.use_fused_ff1 = false;
+        else if (a == "--fused_head_loss") cfg.use_fused_head_loss = true;
+        else if (a == "--no_fused_head_loss") cfg.use_fused_head_loss = false;
         else if (a == "--fused_noise_gemm") cfg.use_fused_noise_gemm = true;
         else if (a == "--no_fused_noise_gemm") cfg.use_fused_noise_gemm = false;
         else if (a == "--noise_batch") cfg.noise_batch = true;
@@ -4294,10 +4331,10 @@ int main(int argc, char** argv) {
         else if (a == "--nvfp4_stages") { cfg.nvfp4_stage_count = parse_nvfp4_stage_count(next(i)); nvfp4_stage_specified = true; }
         else if (a == "--nvfp4_decomp") { cfg.nvfp4_decomp = parse_nvfp4_decomp(next(i)); nvfp4_decomp_specified = true; }
         else if (a == "--nvfp4_splits") { cfg.nvfp4_splits = std::max(1, std::stoi(next(i))); nvfp4_splits_specified = true; }
-        else if (a == "--nvfp4_autotune") cfg.nvfp4_autotune = true;
-        else if (a == "--no_nvfp4_autotune") cfg.nvfp4_autotune = false;
-        else if (a == "--efla_fused") cfg.use_fused_efla = true;
-        else if (a == "--no_efla_fused") cfg.use_fused_efla = false;
+        else if (a == "--nvfp4_autotune") { cfg.nvfp4_autotune = true; nvfp4_autotune_specified = true; }
+        else if (a == "--no_nvfp4_autotune") { cfg.nvfp4_autotune = false; nvfp4_autotune_specified = true; }
+        else if (a == "--efla_fused") { cfg.use_fused_efla = true; efla_fused_specified = true; }
+        else if (a == "--no_efla_fused") { cfg.use_fused_efla = false; efla_fused_specified = true; }
         else if (a == "--efla_mixed") cfg.use_efla_mixed = true;
         else if (a == "--no_efla_mixed") cfg.use_efla_mixed = false;
         else if (a == "--efla_fuse_diff") cfg.use_efla_fuse_diff = true;
@@ -4385,9 +4422,9 @@ int main(int argc, char** argv) {
                 "  --pop N            ES population (even, default 2048)\n"
                 "  --batch N          batch size (default 32)\n"
                 "  --seq N            sequence length (default 64)\n"
-                "  --hidden H         hidden dim (default 128)\n"
+                "  --hidden H         hidden dim (default 512)\n"
                 "  --layers L         number of EFLA blocks (default 4)\n"
-                "  --mlp_mult M       MLP expansion ratio (default 4)\n"
+                "  --mlp_mult M       MLP expansion ratio (default 2)\n"
                 "  --model_8m         preset ~8M params (hidden=416, layers=4, mlp_mult=4)\n"
                 "                    + tuned defaults if not overridden: lr=0.24, thresh=0.10,\n"
                 "                      sigma_shift=3, act_scale=0.8, mlp_act_scale=1.0,\n"
@@ -4406,7 +4443,7 @@ int main(int argc, char** argv) {
                 "  --no_gpu_noise     generate noise weights on CPU\n"
                 "  --gpu_update       update ternary weights on GPU (default on)\n"
                 "  --no_gpu_update    update ternary weights on CPU\n"
-                "  --cuda_graph       capture forward pass in a CUDA graph (default on)\n"
+                "  --cuda_graph       capture forward pass in a CUDA graph (default off)\n"
                 "  --no_cuda_graph    disable CUDA graph capture\n"
                 "  --graph_full_eval  include loss copy in CUDA graph (default on)\n"
                 "  --no_graph_full_eval keep loss copy outside CUDA graph\n"
@@ -4423,6 +4460,8 @@ int main(int argc, char** argv) {
                 "  --no_qkv_split_bias do not fuse beta bias into split kernel\n"
                 "  --fused_ff1        fuse FFN GEMM + GELU + quantize when possible (default on)\n"
                 "  --no_fused_ff1     disable fused FFN GEMM path\n"
+                "  --fused_head_loss  fuse head GEMM + loss (dp4a, vocab<=256, default off)\n"
+                "  --no_fused_head_loss disable fused head GEMM + loss\n"
                 "  --fused_noise_gemm fuse GEMM + noise add for float outputs (default on)\n"
                 "  --no_fused_noise_gemm disable fused noise GEMM path\n"
                 "  --noise_batch     batch GPU noise fills in one launch (default on)\n"
@@ -4435,11 +4474,11 @@ int main(int argc, char** argv) {
                 "  --nvfp4_schedule {auto|cooperative|pingpong} (default auto)\n"
                 "  --nvfp4_quant {warp16|warp4} (default warp16)\n"
                 "  --nvfp4_stages {auto|2|3|4} (default auto)\n"
-                "  --nvfp4_decomp {auto|data|splitk|streamk} (default auto)\n"
-                "  --nvfp4_splits N  split-K factor for nvfp4 (default 1)\n"
-                "  --nvfp4_autotune enable nvfp4 tuning for unset options (default on)\n"
+                "  --nvfp4_decomp {auto|data|splitk|streamk} (default splitk)\n"
+                "  --nvfp4_splits N  split-K factor for nvfp4 (default 2)\n"
+                "  --nvfp4_autotune enable nvfp4 tuning for unset options (default off)\n"
                 "  --no_nvfp4_autotune disable nvfp4 tuning\n"
-                "  --efla_fused      use single-kernel EFLA step (default on)\n"
+                "  --efla_fused      use single-kernel EFLA step (default off)\n"
                 "  --no_efla_fused   disable fused EFLA step\n"
                 "  --efla_mixed      store k_usage/diff in FP16 during EFLA step (default off)\n"
                 "  --no_efla_mixed   disable mixed-precision EFLA step\n"
@@ -4620,6 +4659,60 @@ int main(int argc, char** argv) {
     if (cfg.gemm_backend != TrainConfig::GemmBackend::CutlassNvfp4) {
         cfg.nvfp4_autotune = false;
     }
+    const bool nvfp4_backend = (cfg.gemm_backend == TrainConfig::GemmBackend::CutlassNvfp4);
+    if (nvfp4_backend && cfg.hidden >= 512) {
+        bool set_decomp = false;
+        bool set_splits = false;
+        bool set_autotune = false;
+        bool set_graph = false;
+        if (!nvfp4_decomp_specified &&
+            cfg.nvfp4_decomp != bitnet_cuda::Nvfp4Decomposition::SplitK) {
+            cfg.nvfp4_decomp = bitnet_cuda::Nvfp4Decomposition::SplitK;
+            set_decomp = true;
+        }
+        if (!nvfp4_splits_specified && cfg.nvfp4_splits != 2) {
+            cfg.nvfp4_splits = 2;
+            set_splits = true;
+        }
+        if (!nvfp4_autotune_specified && cfg.nvfp4_autotune) {
+            cfg.nvfp4_autotune = false;
+            set_autotune = true;
+        }
+        if (!cuda_graph_specified && cfg.use_cuda_graph) {
+            cfg.use_cuda_graph = false;
+            set_graph = true;
+        }
+        if (set_decomp || set_splits || set_autotune || set_graph) {
+            std::cerr << "Note: nvfp4 defaults for hidden>=512:";
+            bool first = true;
+            if (set_decomp) {
+                std::cerr << (first ? " " : ", ") << "decomp=splitk";
+                first = false;
+            }
+            if (set_splits) {
+                std::cerr << (first ? " " : ", ") << "splits=2";
+                first = false;
+            }
+            if (set_graph) {
+                std::cerr << (first ? " " : ", ") << "cuda_graph=off";
+                first = false;
+            }
+            if (set_autotune) {
+                std::cerr << (first ? " " : ", ") << "autotune=off";
+            }
+            std::cerr << ". Override with --nvfp4_*";
+            if (set_graph) {
+                std::cerr << " or --cuda_graph";
+            }
+            std::cerr << ".\n";
+        }
+    }
+    if (cfg.method == TrainConfig::Method::EFLA && cfg.state_dim == 0 && cfg.hidden >= 512) {
+        if (!efla_fused_specified && cfg.use_fused_efla) {
+            cfg.use_fused_efla = false;
+            std::cerr << "Note: disabling fused EFLA step for hidden>=512; override with --efla_fused.\n";
+        }
+    }
     if (cfg.nvfp4_autotune) {
         cfg.nvfp4_tune_schedule = !nvfp4_schedule_specified;
         cfg.nvfp4_tune_quant = !nvfp4_quant_specified;
@@ -4745,6 +4838,7 @@ int main(int argc, char** argv) {
                                                                  cfg.use_fused_qkv, cfg.use_qkv_split_kernel,
                                                                  cfg.qkv_split_vec4, cfg.use_qkv_split_bias,
                                                                  cfg.use_fused_ff1,
+                                                                 cfg.use_fused_head_loss,
                                                                  cfg.use_fused_noise_gemm,
                                                                  cfg.use_fused_efla,
                                                                  cfg.use_efla_mixed,
