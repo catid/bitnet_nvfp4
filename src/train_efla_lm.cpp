@@ -19,11 +19,16 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
+#include <future>
 #include <iostream>
+#include <mutex>
 #include <numbers>
 #include <memory>
+#include <queue>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -42,6 +47,62 @@ static inline void cuda_check(cudaError_t err, const char* what) {
     std::string msg = std::string("CUDA error: ") + what + ": " + cudaGetErrorString(err);
     throw std::runtime_error(msg);
 }
+
+class ThreadPool {
+public:
+    explicit ThreadPool(size_t threads) {
+        if (threads == 0) threads = 1;
+        workers_.reserve(threads);
+        for (size_t i = 0; i < threads; ++i) {
+            workers_.emplace_back([this]() { worker_loop(); });
+        }
+    }
+
+    ~ThreadPool() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        for (auto& t : workers_) {
+            if (t.joinable()) t.join();
+        }
+    }
+
+    template <class F>
+    std::future<void> enqueue(F&& f) {
+        auto task = std::make_shared<std::packaged_task<void()>>(std::forward<F>(f));
+        std::future<void> result = task->get_future();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (stop_) throw std::runtime_error("enqueue on stopped ThreadPool");
+            tasks_.emplace([task]() { (*task)(); });
+        }
+        cv_.notify_one();
+        return result;
+    }
+
+private:
+    void worker_loop() {
+        for (;;) {
+            std::function<void()> task;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait(lock, [this]() { return stop_ || !tasks_.empty(); });
+                if (stop_ && tasks_.empty()) return;
+                task = std::move(tasks_.front());
+                tasks_.pop();
+            }
+            task();
+        }
+    }
+
+    std::vector<std::thread> workers_;
+    std::queue<std::function<void()>> tasks_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool stop_ = false;
+};
 
 
 #ifdef BITNET_EGGROLL_HAS_NVTX
@@ -4176,6 +4237,8 @@ int main(int argc, char** argv) {
             }
         }
         CudaEflaLm& model = *models.front();
+        const size_t pool_threads = std::max<size_t>(1, std::max(models.size(), devices.size()) + 1);
+        ThreadPool pool(pool_threads);
 
         const int pairs = cfg.population / 2;
         const int method_id = static_cast<int>(cfg.method);
@@ -4290,14 +4353,14 @@ int main(int argc, char** argv) {
             const float noise_scale = 1.0f / static_cast<float>(1 << sigma_t);
 
             double next_sample_s = 0.0;
-            std::thread prefetch_thread;
+            std::future<void> prefetch_future;
             bool prefetch_active = false;
             next_uploaded = false;
             if (!cfg.fixed_train && (epoch + 1) < cfg.epochs) {
                 const uint64_t next_seed = rng::mix(cfg.data_seed, static_cast<uint64_t>(epoch + 1));
                 const int buf_upload = buf_next;
                 prefetch_active = true;
-                prefetch_thread = std::thread([&, buf_upload]() {
+                prefetch_future = pool.enqueue([&, buf_upload, next_seed]() {
                     const auto t0 = Clock::now();
                     data.sample_batch(cfg.batch, cfg.seq_len, next_seed, inputs_next, targets_next);
                     next_sample_s = seconds_since(t0);
@@ -4461,12 +4524,12 @@ int main(int argc, char** argv) {
                 if (models.size() == 1) {
                     eval_worker(0);
                 } else {
-                    std::vector<std::thread> threads;
-                    threads.reserve(models.size());
+                    std::vector<std::future<void>> futures;
+                    futures.reserve(models.size());
                     for (size_t di = 0; di < models.size(); ++di) {
-                        threads.emplace_back(eval_worker, di);
+                        futures.push_back(pool.enqueue([&, di]() { eval_worker(di); }));
                     }
-                    for (auto& t : threads) t.join();
+                    for (auto& f : futures) f.get();
                 }
                 eval_s = seconds_since(t0);
             }
@@ -4556,12 +4619,12 @@ int main(int argc, char** argv) {
                 if (devices.size() == 1) {
                     update_worker(0);
                 } else {
-                    std::vector<std::thread> threads;
-                    threads.reserve(devices.size());
+                    std::vector<std::future<void>> futures;
+                    futures.reserve(devices.size());
                     for (size_t di = 0; di < devices.size(); ++di) {
-                        threads.emplace_back(update_worker, di);
+                        futures.push_back(pool.enqueue([&, di]() { update_worker(di); }));
                     }
-                    for (auto& t : threads) t.join();
+                    for (auto& f : futures) f.get();
                 }
 
                 update_vector(w.head_bias, st_head_bias, weights, cfg, epoch, kSaltHeadBias, lr_t, thresh_t);
@@ -4684,7 +4747,7 @@ int main(int argc, char** argv) {
             }
 
             if (prefetch_active) {
-                prefetch_thread.join();
+                prefetch_future.get();
                 inputs_cur.swap(inputs_next);
                 targets_cur.swap(targets_next);
                 cur_sample_s = next_sample_s;
