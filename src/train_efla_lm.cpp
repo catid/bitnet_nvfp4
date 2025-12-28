@@ -4791,6 +4791,56 @@ int main(int argc, char** argv) {
         const int pairs = cfg.population / 2;
         const int method_id = static_cast<int>(cfg.method);
 
+        struct EvalScratch {
+            std::vector<uint64_t> seed_wq;
+            std::vector<uint64_t> seed_wk;
+            std::vector<uint64_t> seed_wv;
+            std::vector<uint64_t> seed_wbeta;
+            std::vector<uint64_t> seed_ff1;
+            std::vector<uint64_t> seed_ff2;
+            std::vector<float> beta_bias_noise;
+            std::vector<float> pos_noise;
+            std::vector<float> pos_noisy;
+            std::vector<float> head_bias_noise;
+            EflaLmWeights noise;
+        };
+
+        std::vector<EvalScratch> eval_scratch(models.size());
+        std::vector<std::pair<int, int>> eval_ranges(models.size(), {0, 0});
+        if (pairs > 0 && !models.empty()) {
+            const int num_workers = static_cast<int>(models.size());
+            const int pairs_per_worker = (pairs + num_workers - 1) / num_workers;
+            for (int wi = 0; wi < num_workers; ++wi) {
+                const int start = wi * pairs_per_worker;
+                const int end = std::min(pairs, start + pairs_per_worker);
+                eval_ranges[static_cast<size_t>(wi)] = {start, end};
+            }
+        }
+        for (auto& scratch : eval_scratch) {
+            scratch.seed_wq.resize(static_cast<size_t>(cfg.layers));
+            scratch.seed_wk.resize(static_cast<size_t>(cfg.layers));
+            scratch.seed_wv.resize(static_cast<size_t>(cfg.layers));
+            scratch.seed_wbeta.resize(static_cast<size_t>(cfg.layers));
+            scratch.seed_ff1.resize(static_cast<size_t>(cfg.layers));
+            scratch.seed_ff2.resize(static_cast<size_t>(cfg.layers));
+            scratch.beta_bias_noise.resize(static_cast<size_t>(cfg.layers));
+            scratch.head_bias_noise.resize(static_cast<size_t>(cfg.vocab));
+            if (cfg.train_pos) {
+                scratch.pos_noise.resize(pos.size());
+                scratch.pos_noisy.resize(pos.size());
+            }
+            if (!cfg.use_gpu_noise) {
+                scratch.noise.wq.resize(static_cast<size_t>(cfg.layers));
+                scratch.noise.wk.resize(static_cast<size_t>(cfg.layers));
+                scratch.noise.wv.resize(static_cast<size_t>(cfg.layers));
+                scratch.noise.wbeta.resize(static_cast<size_t>(cfg.layers));
+                scratch.noise.ff1.resize(static_cast<size_t>(cfg.layers));
+                scratch.noise.ff2.resize(static_cast<size_t>(cfg.layers));
+            }
+        }
+
+        std::vector<float> weights(static_cast<size_t>(pairs), 0.0f);
+
         float* h_pair_weights = nullptr;
         if (cfg.use_gpu_update && pairs > 0) {
             cuda_check(cudaHostAlloc(reinterpret_cast<void**>(&h_pair_weights),
@@ -5006,34 +5056,29 @@ int main(int argc, char** argv) {
                 cur_uploaded = true;
             }
 
-            std::vector<float> raw(pairs, 0.0f);
             auto eval_worker = [&](size_t di) {
+                const auto range = eval_ranges[di];
+                const int start = range.first;
+                const int end = range.second;
+                if (start >= end) return;
                 const int dev = models[di]->device();
                 cuda_check(cudaSetDevice(dev), "cudaSetDevice eval_worker");
                 CudaEflaLm& worker = *models[di];
 
-                std::vector<uint64_t> seed_wq(static_cast<size_t>(cfg.layers));
-                std::vector<uint64_t> seed_wk(static_cast<size_t>(cfg.layers));
-                std::vector<uint64_t> seed_wv(static_cast<size_t>(cfg.layers));
-                std::vector<uint64_t> seed_wbeta(static_cast<size_t>(cfg.layers));
-                std::vector<uint64_t> seed_ff1(static_cast<size_t>(cfg.layers));
-                std::vector<uint64_t> seed_ff2(static_cast<size_t>(cfg.layers));
-                std::vector<float> beta_bias_noise(static_cast<size_t>(cfg.layers));
-                std::vector<float> pos_noise;
-                std::vector<float> pos_noisy;
-                std::vector<float> head_bias_noise;
+                EvalScratch& scratch = eval_scratch[di];
+                std::vector<uint64_t>& seed_wq = scratch.seed_wq;
+                std::vector<uint64_t>& seed_wk = scratch.seed_wk;
+                std::vector<uint64_t>& seed_wv = scratch.seed_wv;
+                std::vector<uint64_t>& seed_wbeta = scratch.seed_wbeta;
+                std::vector<uint64_t>& seed_ff1 = scratch.seed_ff1;
+                std::vector<uint64_t>& seed_ff2 = scratch.seed_ff2;
+                std::vector<float>& beta_bias_noise = scratch.beta_bias_noise;
+                std::vector<float>& pos_noise = scratch.pos_noise;
+                std::vector<float>& pos_noisy = scratch.pos_noisy;
+                std::vector<float>& head_bias_noise = scratch.head_bias_noise;
+                EflaLmWeights& noise = scratch.noise;
 
-                EflaLmWeights noise;
-                if (!cfg.use_gpu_noise) {
-                    noise.wq.resize(static_cast<size_t>(cfg.layers));
-                    noise.wk.resize(static_cast<size_t>(cfg.layers));
-                    noise.wv.resize(static_cast<size_t>(cfg.layers));
-                    noise.wbeta.resize(static_cast<size_t>(cfg.layers));
-                    noise.ff1.resize(static_cast<size_t>(cfg.layers));
-                    noise.ff2.resize(static_cast<size_t>(cfg.layers));
-                }
-
-                for (int p = static_cast<int>(di); p < pairs; p += static_cast<int>(models.size())) {
+                for (int p = start; p < end; ++p) {
                     const uint64_t pair_seed =
                         rng::mix(cfg.seed, rng::mix(static_cast<uint64_t>(epoch), static_cast<uint64_t>(p)));
 
@@ -5131,7 +5176,7 @@ int main(int argc, char** argv) {
                                                               cfg.int8_residual, cfg.absmean_norm,
                                                               w.head_bias.data(), head_bias_noise.data(),
                                                               w.beta_bias.data(), beta_bias_noise.data());
-                    raw[p] = -(loss_p - loss_m);
+                    weights[static_cast<size_t>(p)] = -(loss_p - loss_m);
                 }
             };
 
@@ -5151,7 +5196,6 @@ int main(int argc, char** argv) {
                 eval_s = seconds_since(t0);
             }
 
-            std::vector<float> weights = raw;
             shape_pair_weights(weights, cfg);
             if (h_pair_weights) {
                 std::copy(weights.begin(), weights.end(), h_pair_weights);
