@@ -358,6 +358,226 @@ struct EflaLmWeights {
     std::vector<float> beta_bias; // [L]
 };
 
+static int qkv_fused_cols_aligned(int hidden, bool use_fused_qkv) {
+    if (!use_fused_qkv) return 0;
+    const int valid = hidden * 3 + 1;
+    return (valid + 31) & ~31;
+}
+
+struct DeviceWeights {
+    int device = 0;
+    int V = 0;
+    int H = 0;
+    int L = 0;
+    int F = 0;
+    int B = 0;
+    bool use_packed_gemm = false;
+    bool use_nvfp4 = false;
+    bool use_fused_qkv_nvfp4 = false;
+    int qkv_fused_cols = 0;
+    float win_out_scale = 1.0f;
+    float q_out_scale = 1.0f;
+    float k_out_scale = 1.0f;
+    float v_out_scale = 1.0f;
+    float beta_out_scale = 1.0f;
+    float ff1_out_scale = 1.0f;
+    float ff2_out_scale = 1.0f;
+    float head_out_scale = 1.0f;
+
+    int8_t* d_emb_w = nullptr;
+    int8_t* d_win = nullptr;
+    int8_t* d_wq = nullptr;
+    int8_t* d_wk = nullptr;
+    int8_t* d_wv = nullptr;
+    int8_t* d_wbeta = nullptr;
+    int8_t* d_ff1 = nullptr;
+    int8_t* d_ff2 = nullptr;
+    int8_t* d_head = nullptr;
+    uint32_t* d_win_packed = nullptr;
+    uint32_t* d_wq_packed = nullptr;
+    uint32_t* d_wk_packed = nullptr;
+    uint32_t* d_wv_packed = nullptr;
+    uint32_t* d_wbeta_packed = nullptr;
+    uint32_t* d_ff1_packed = nullptr;
+    uint32_t* d_ff2_packed = nullptr;
+    uint32_t* d_head_packed = nullptr;
+
+    void* d_emb_nvfp4 = nullptr;
+    void* d_win_nvfp4 = nullptr;
+    void* d_head_nvfp4 = nullptr;
+    void* d_emb_sfb = nullptr;
+    void* d_win_sfb = nullptr;
+    void* d_head_sfb = nullptr;
+    std::vector<void*> d_wq_nvfp4;
+    std::vector<void*> d_wk_nvfp4;
+    std::vector<void*> d_wv_nvfp4;
+    std::vector<void*> d_wbeta_nvfp4;
+    std::vector<void*> d_ff1_nvfp4;
+    std::vector<void*> d_ff2_nvfp4;
+    std::vector<void*> d_wq_sfb;
+    std::vector<void*> d_wk_sfb;
+    std::vector<void*> d_wv_sfb;
+    std::vector<void*> d_wbeta_sfb;
+    std::vector<void*> d_ff1_sfb;
+    std::vector<void*> d_ff2_sfb;
+    std::vector<void*> d_wqkv_nvfp4;
+    std::vector<void*> d_wqkv_sfb;
+
+    DeviceWeights(int device_,
+                  int vocab,
+                  int hidden,
+                  int layers,
+                  int mlp_mult,
+                  int batch,
+                  bool use_packed_gemm_,
+                  bool use_nvfp4_,
+                  bool use_fused_qkv_nvfp4_)
+        : device(device_),
+          V(vocab),
+          H(hidden),
+          L(layers),
+          F(hidden * std::max(1, mlp_mult)),
+          B(batch),
+          use_packed_gemm(use_packed_gemm_),
+          use_nvfp4(use_nvfp4_),
+          use_fused_qkv_nvfp4(use_fused_qkv_nvfp4_),
+          qkv_fused_cols(qkv_fused_cols_aligned(hidden, use_fused_qkv_nvfp4_)) {
+        cuda_check(cudaSetDevice(device), "cudaSetDevice DeviceWeights");
+
+        const size_t emb_bytes = static_cast<size_t>(V) * H;
+        const size_t hh_bytes = static_cast<size_t>(H) * H;
+        const size_t hf_bytes = static_cast<size_t>(H) * F;
+        const size_t h_bytes = static_cast<size_t>(H);
+        const size_t head_bytes = static_cast<size_t>(V) * H;
+
+        // Base weights.
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_emb_w), emb_bytes), "cudaMalloc emb");
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_win), hh_bytes), "cudaMalloc win");
+        const size_t hh_layers_bytes = static_cast<size_t>(L) * hh_bytes;
+        const size_t h_layers_bytes = static_cast<size_t>(L) * h_bytes;
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_wq), hh_layers_bytes), "cudaMalloc wq");
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_wk), hh_layers_bytes), "cudaMalloc wk");
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_wv), hh_layers_bytes), "cudaMalloc wv");
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_wbeta), h_layers_bytes), "cudaMalloc wbeta");
+        const size_t hf_layers_bytes = static_cast<size_t>(L) * hf_bytes;
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_ff1), hf_layers_bytes), "cudaMalloc ff1");
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_ff2), hf_layers_bytes), "cudaMalloc ff2");
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_head), head_bytes), "cudaMalloc head");
+
+        if (use_packed_gemm) {
+            const int pack_cols_h = (H + 15) / 16;
+            const int pack_cols_f = (F + 15) / 16;
+            const size_t win_pack = static_cast<size_t>(H) * pack_cols_h;
+            const size_t hh_layers_pack = static_cast<size_t>(L) * H * pack_cols_h;
+            const size_t h_layers_pack = static_cast<size_t>(L) * pack_cols_h;
+            const size_t ff1_layers_pack = static_cast<size_t>(L) * F * pack_cols_h;
+            const size_t ff2_layers_pack = static_cast<size_t>(L) * H * pack_cols_f;
+            const size_t head_pack = static_cast<size_t>(V) * pack_cols_h;
+
+            cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_win_packed), win_pack * sizeof(uint32_t)), "cudaMalloc win_packed");
+            cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_wq_packed), hh_layers_pack * sizeof(uint32_t)), "cudaMalloc wq_packed");
+            cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_wk_packed), hh_layers_pack * sizeof(uint32_t)), "cudaMalloc wk_packed");
+            cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_wv_packed), hh_layers_pack * sizeof(uint32_t)), "cudaMalloc wv_packed");
+            cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_wbeta_packed), h_layers_pack * sizeof(uint32_t)), "cudaMalloc wbeta_packed");
+            cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_ff1_packed), ff1_layers_pack * sizeof(uint32_t)), "cudaMalloc ff1_packed");
+            cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_ff2_packed), ff2_layers_pack * sizeof(uint32_t)), "cudaMalloc ff2_packed");
+            cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_head_packed), head_pack * sizeof(uint32_t)), "cudaMalloc head_packed");
+        }
+
+        if (use_nvfp4) {
+            auto alloc_nvfp4_b = [&](int rows, int cols, void** d_mat, void** d_sfb, const char* tag) {
+                const size_t mat_bytes = bitnet_cuda::nvfp4_matrix_bytes(rows, cols);
+                const size_t sfb_bytes = bitnet_cuda::nvfp4_sfb_bytes(B, rows, cols);
+                cuda_check(cudaMalloc(reinterpret_cast<void**>(d_mat), mat_bytes), tag);
+                cuda_check(cudaMalloc(reinterpret_cast<void**>(d_sfb), sfb_bytes), tag);
+            };
+
+            alloc_nvfp4_b(V, H, &d_emb_nvfp4, &d_emb_sfb, "cudaMalloc nvfp4 emb");
+            alloc_nvfp4_b(H, H, &d_win_nvfp4, &d_win_sfb, "cudaMalloc nvfp4 win");
+            alloc_nvfp4_b(V, H, &d_head_nvfp4, &d_head_sfb, "cudaMalloc nvfp4 head");
+
+            d_wq_nvfp4.resize(static_cast<size_t>(L), nullptr);
+            d_wk_nvfp4.resize(static_cast<size_t>(L), nullptr);
+            d_wv_nvfp4.resize(static_cast<size_t>(L), nullptr);
+            d_wbeta_nvfp4.resize(static_cast<size_t>(L), nullptr);
+            d_ff1_nvfp4.resize(static_cast<size_t>(L), nullptr);
+            d_ff2_nvfp4.resize(static_cast<size_t>(L), nullptr);
+            d_wq_sfb.resize(static_cast<size_t>(L), nullptr);
+            d_wk_sfb.resize(static_cast<size_t>(L), nullptr);
+            d_wv_sfb.resize(static_cast<size_t>(L), nullptr);
+            d_wbeta_sfb.resize(static_cast<size_t>(L), nullptr);
+            d_ff1_sfb.resize(static_cast<size_t>(L), nullptr);
+            d_ff2_sfb.resize(static_cast<size_t>(L), nullptr);
+            d_wqkv_nvfp4.resize(static_cast<size_t>(L), nullptr);
+            d_wqkv_sfb.resize(static_cast<size_t>(L), nullptr);
+
+            for (int l = 0; l < L; ++l) {
+                if (use_fused_qkv_nvfp4) {
+                    alloc_nvfp4_b(qkv_fused_cols, H,
+                                  &d_wqkv_nvfp4[static_cast<size_t>(l)],
+                                  &d_wqkv_sfb[static_cast<size_t>(l)],
+                                  "cudaMalloc nvfp4 wqkv");
+                } else {
+                    alloc_nvfp4_b(H, H, &d_wq_nvfp4[static_cast<size_t>(l)],
+                                  &d_wq_sfb[static_cast<size_t>(l)], "cudaMalloc nvfp4 wq");
+                    alloc_nvfp4_b(H, H, &d_wk_nvfp4[static_cast<size_t>(l)],
+                                  &d_wk_sfb[static_cast<size_t>(l)], "cudaMalloc nvfp4 wk");
+                    alloc_nvfp4_b(H, H, &d_wv_nvfp4[static_cast<size_t>(l)],
+                                  &d_wv_sfb[static_cast<size_t>(l)], "cudaMalloc nvfp4 wv");
+                    alloc_nvfp4_b(1, H, &d_wbeta_nvfp4[static_cast<size_t>(l)],
+                                  &d_wbeta_sfb[static_cast<size_t>(l)], "cudaMalloc nvfp4 wbeta");
+                }
+                alloc_nvfp4_b(F, H, &d_ff1_nvfp4[static_cast<size_t>(l)],
+                              &d_ff1_sfb[static_cast<size_t>(l)], "cudaMalloc nvfp4 ff1");
+                alloc_nvfp4_b(H, F, &d_ff2_nvfp4[static_cast<size_t>(l)],
+                              &d_ff2_sfb[static_cast<size_t>(l)], "cudaMalloc nvfp4 ff2");
+            }
+        }
+    }
+
+    ~DeviceWeights() {
+        cuda_check(cudaSetDevice(device), "cudaSetDevice DeviceWeights free");
+        if (d_head) cudaFree(d_head);
+        if (d_ff2) cudaFree(d_ff2);
+        if (d_ff1) cudaFree(d_ff1);
+        if (d_wbeta) cudaFree(d_wbeta);
+        if (d_wv) cudaFree(d_wv);
+        if (d_wk) cudaFree(d_wk);
+        if (d_wq) cudaFree(d_wq);
+        if (d_win) cudaFree(d_win);
+        if (d_emb_w) cudaFree(d_emb_w);
+        if (d_head_packed) cudaFree(d_head_packed);
+        if (d_ff2_packed) cudaFree(d_ff2_packed);
+        if (d_ff1_packed) cudaFree(d_ff1_packed);
+        if (d_wbeta_packed) cudaFree(d_wbeta_packed);
+        if (d_wv_packed) cudaFree(d_wv_packed);
+        if (d_wk_packed) cudaFree(d_wk_packed);
+        if (d_wq_packed) cudaFree(d_wq_packed);
+        if (d_win_packed) cudaFree(d_win_packed);
+
+        for (void* p : d_ff2_sfb) if (p) cudaFree(p);
+        for (void* p : d_ff1_sfb) if (p) cudaFree(p);
+        for (void* p : d_wbeta_sfb) if (p) cudaFree(p);
+        for (void* p : d_wv_sfb) if (p) cudaFree(p);
+        for (void* p : d_wk_sfb) if (p) cudaFree(p);
+        for (void* p : d_wq_sfb) if (p) cudaFree(p);
+        for (void* p : d_wqkv_sfb) if (p) cudaFree(p);
+        for (void* p : d_ff2_nvfp4) if (p) cudaFree(p);
+        for (void* p : d_ff1_nvfp4) if (p) cudaFree(p);
+        for (void* p : d_wbeta_nvfp4) if (p) cudaFree(p);
+        for (void* p : d_wv_nvfp4) if (p) cudaFree(p);
+        for (void* p : d_wk_nvfp4) if (p) cudaFree(p);
+        for (void* p : d_wq_nvfp4) if (p) cudaFree(p);
+        for (void* p : d_wqkv_nvfp4) if (p) cudaFree(p);
+        if (d_head_sfb) cudaFree(d_head_sfb);
+        if (d_win_sfb) cudaFree(d_win_sfb);
+        if (d_emb_sfb) cudaFree(d_emb_sfb);
+        if (d_head_nvfp4) cudaFree(d_head_nvfp4);
+        if (d_win_nvfp4) cudaFree(d_win_nvfp4);
+        if (d_emb_nvfp4) cudaFree(d_emb_nvfp4);
+    }
+};
+
 class CudaEflaLm {
 public:
     CudaEflaLm(int device, int vocab, int hidden, int layers, int mlp_mult, int batch, int seq_len,
@@ -374,7 +594,8 @@ public:
                bitnet_cuda::Nvfp4StageCount nvfp4_stage_count,
                bitnet_cuda::Nvfp4Decomposition nvfp4_decomp,
                int nvfp4_splits,
-               bool noise_batch)
+               bool noise_batch,
+               std::shared_ptr<DeviceWeights> weights)
         : device_(device),
           V_(vocab),
           H_(hidden),
@@ -406,7 +627,8 @@ public:
         nvfp4_stage_count_(nvfp4_stage_count),
         nvfp4_decomp_(nvfp4_decomp),
         nvfp4_splits_(nvfp4_splits),
-        use_noise_batch_(noise_batch) {
+          use_noise_batch_(noise_batch),
+          weights_(std::move(weights)) {
         cuda_check(cudaSetDevice(device_), "cudaSetDevice");
         if (gemm_backend_ == TrainConfig::GemmBackend::Cutlass) {
             cudaDeviceProp prop{};
@@ -431,6 +653,67 @@ public:
             use_packed_gemm_ = false;
             use_packed_gemm_bitnet_ = false;
         }
+        if (!weights_) {
+            throw std::runtime_error("CudaEflaLm requires shared DeviceWeights");
+        }
+        if (weights_->device != device_ || weights_->V != V_ || weights_->H != H_ ||
+            weights_->L != L_ || weights_->F != F_ || weights_->B != B_) {
+            throw std::runtime_error("DeviceWeights shape mismatch");
+        }
+        if (weights_->use_nvfp4 != use_nvfp4_) {
+            throw std::runtime_error("DeviceWeights NVFP4 mode mismatch");
+        }
+        if (use_packed_gemm_ && !weights_->use_packed_gemm) {
+            throw std::runtime_error("DeviceWeights packed GEMM mismatch");
+        }
+        d_emb_w_ = weights_->d_emb_w;
+        d_win_ = weights_->d_win;
+        d_wq_ = weights_->d_wq;
+        d_wk_ = weights_->d_wk;
+        d_wv_ = weights_->d_wv;
+        d_wbeta_ = weights_->d_wbeta;
+        d_ff1_ = weights_->d_ff1;
+        d_ff2_ = weights_->d_ff2;
+        d_head_ = weights_->d_head;
+        d_win_packed_ = weights_->d_win_packed;
+        d_wq_packed_ = weights_->d_wq_packed;
+        d_wk_packed_ = weights_->d_wk_packed;
+        d_wv_packed_ = weights_->d_wv_packed;
+        d_wbeta_packed_ = weights_->d_wbeta_packed;
+        d_ff1_packed_ = weights_->d_ff1_packed;
+        d_ff2_packed_ = weights_->d_ff2_packed;
+        d_head_packed_ = weights_->d_head_packed;
+        d_emb_nvfp4_ = weights_->d_emb_nvfp4;
+        d_win_nvfp4_ = weights_->d_win_nvfp4;
+        d_head_nvfp4_ = weights_->d_head_nvfp4;
+        d_emb_sfb_ = weights_->d_emb_sfb;
+        d_win_sfb_ = weights_->d_win_sfb;
+        d_head_sfb_ = weights_->d_head_sfb;
+        d_wq_nvfp4_ = weights_->d_wq_nvfp4;
+        d_wk_nvfp4_ = weights_->d_wk_nvfp4;
+        d_wv_nvfp4_ = weights_->d_wv_nvfp4;
+        d_wbeta_nvfp4_ = weights_->d_wbeta_nvfp4;
+        d_ff1_nvfp4_ = weights_->d_ff1_nvfp4;
+        d_ff2_nvfp4_ = weights_->d_ff2_nvfp4;
+        d_wq_sfb_ = weights_->d_wq_sfb;
+        d_wk_sfb_ = weights_->d_wk_sfb;
+        d_wv_sfb_ = weights_->d_wv_sfb;
+        d_wbeta_sfb_ = weights_->d_wbeta_sfb;
+        d_ff1_sfb_ = weights_->d_ff1_sfb;
+        d_ff2_sfb_ = weights_->d_ff2_sfb;
+        d_wqkv_nvfp4_ = weights_->d_wqkv_nvfp4;
+        d_wqkv_sfb_ = weights_->d_wqkv_sfb;
+        use_fused_qkv_nvfp4_ = weights_->use_fused_qkv_nvfp4;
+        qkv_fused_cols_valid_ = H_ * 3 + 1;
+        qkv_fused_cols_ = use_fused_qkv_nvfp4_ ? weights_->qkv_fused_cols : qkv_fused_cols_valid_;
+        win_out_scale_ = weights_->win_out_scale;
+        q_out_scale_ = weights_->q_out_scale;
+        k_out_scale_ = weights_->k_out_scale;
+        v_out_scale_ = weights_->v_out_scale;
+        beta_out_scale_ = weights_->beta_out_scale;
+        ff1_out_scale_ = weights_->ff1_out_scale;
+        ff2_out_scale_ = weights_->ff2_out_scale;
+        head_out_scale_ = weights_->head_out_scale;
         if (use_efla_update_wmma_ && !use_fp16_state_) {
             fprintf(stderr, "efla_update_wmma requires FP16 state; disabling.\n");
             use_efla_update_wmma_ = false;
@@ -506,19 +789,9 @@ public:
         const size_t h_bytes = static_cast<size_t>(H_);
         const size_t head_bytes = static_cast<size_t>(V_) * H_;
 
-        // Base weights.
-        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_emb_w_), emb_bytes), "cudaMalloc emb");
-        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_win_), hh_bytes), "cudaMalloc win");
         const size_t hh_layers_bytes = static_cast<size_t>(L_) * hh_bytes;
         const size_t h_layers_bytes = static_cast<size_t>(L_) * h_bytes;
-        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_wq_), hh_layers_bytes), "cudaMalloc wq");
-        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_wk_), hh_layers_bytes), "cudaMalloc wk");
-        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_wv_), hh_layers_bytes), "cudaMalloc wv");
-        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_wbeta_), h_layers_bytes), "cudaMalloc wbeta");
         const size_t hf_layers_bytes = static_cast<size_t>(L_) * hf_bytes;
-        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_ff1_), hf_layers_bytes), "cudaMalloc ff1");
-        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_ff2_), hf_layers_bytes), "cudaMalloc ff2");
-        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_head_), head_bytes), "cudaMalloc head");
 
         // Noise weights (full-matrix noise, materialized).
         cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_emb_noise_), emb_bytes), "cudaMalloc emb_noise");
@@ -540,15 +813,6 @@ public:
             const size_t ff1_layers_pack = static_cast<size_t>(L_) * F_ * pack_cols_h_;
             const size_t ff2_layers_pack = static_cast<size_t>(L_) * H_ * pack_cols_f_;
             const size_t head_pack = static_cast<size_t>(V_) * pack_cols_h_;
-
-            cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_win_packed_), win_pack * sizeof(uint32_t)), "cudaMalloc win_packed");
-            cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_wq_packed_), hh_layers_pack * sizeof(uint32_t)), "cudaMalloc wq_packed");
-            cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_wk_packed_), hh_layers_pack * sizeof(uint32_t)), "cudaMalloc wk_packed");
-            cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_wv_packed_), hh_layers_pack * sizeof(uint32_t)), "cudaMalloc wv_packed");
-            cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_wbeta_packed_), h_layers_pack * sizeof(uint32_t)), "cudaMalloc wbeta_packed");
-            cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_ff1_packed_), ff1_layers_pack * sizeof(uint32_t)), "cudaMalloc ff1_packed");
-            cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_ff2_packed_), ff2_layers_pack * sizeof(uint32_t)), "cudaMalloc ff2_packed");
-            cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_head_packed_), head_pack * sizeof(uint32_t)), "cudaMalloc head_packed");
 
             cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_win_noise_packed_), win_pack * sizeof(uint32_t)), "cudaMalloc win_noise_packed");
             cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_wq_noise_packed_), hh_layers_pack * sizeof(uint32_t)), "cudaMalloc wq_noise_packed");
@@ -612,40 +876,10 @@ public:
                 cuda_check(cudaMalloc(reinterpret_cast<void**>(d_mat), mat_bytes), tag);
                 cuda_check(cudaMalloc(reinterpret_cast<void**>(d_sfb), sfb_bytes), tag);
             };
-
-            alloc_nvfp4_b(V_, H_, &d_emb_nvfp4_, &d_emb_sfb_, "cudaMalloc nvfp4 emb");
-            alloc_nvfp4_b(H_, H_, &d_win_nvfp4_, &d_win_sfb_, "cudaMalloc nvfp4 win");
-            alloc_nvfp4_b(V_, H_, &d_head_nvfp4_, &d_head_sfb_, "cudaMalloc nvfp4 head");
             alloc_nvfp4_b(V_, H_, &d_emb_noise_nvfp4_, &d_emb_noise_sfb_, "cudaMalloc nvfp4 emb_noise");
             alloc_nvfp4_b(H_, H_, &d_win_noise_nvfp4_, &d_win_noise_sfb_, "cudaMalloc nvfp4 win_noise");
             alloc_nvfp4_b(V_, H_, &d_head_noise_nvfp4_, &d_head_noise_sfb_, "cudaMalloc nvfp4 head_noise");
 
-            use_fused_qkv_nvfp4_ = use_fused_qkv_;
-            qkv_fused_cols_valid_ = H_ * 3 + 1;
-            qkv_fused_cols_ = qkv_fused_cols_valid_;
-            if (use_fused_qkv_nvfp4_) {
-                const int aligned = (qkv_fused_cols_valid_ + 31) & ~31;
-                qkv_fused_cols_ = aligned;
-                if (aligned != qkv_fused_cols_valid_) {
-                    fprintf(stderr,
-                            "nvfp4 fused QKV padded (rows=%d -> %d) for alignment.\n",
-                            qkv_fused_cols_valid_, aligned);
-                }
-            }
-            d_wq_nvfp4_.resize(static_cast<size_t>(L_), nullptr);
-            d_wk_nvfp4_.resize(static_cast<size_t>(L_), nullptr);
-            d_wv_nvfp4_.resize(static_cast<size_t>(L_), nullptr);
-            d_wbeta_nvfp4_.resize(static_cast<size_t>(L_), nullptr);
-            d_ff1_nvfp4_.resize(static_cast<size_t>(L_), nullptr);
-            d_ff2_nvfp4_.resize(static_cast<size_t>(L_), nullptr);
-            d_wq_sfb_.resize(static_cast<size_t>(L_), nullptr);
-            d_wk_sfb_.resize(static_cast<size_t>(L_), nullptr);
-            d_wv_sfb_.resize(static_cast<size_t>(L_), nullptr);
-            d_wbeta_sfb_.resize(static_cast<size_t>(L_), nullptr);
-            d_ff1_sfb_.resize(static_cast<size_t>(L_), nullptr);
-            d_ff2_sfb_.resize(static_cast<size_t>(L_), nullptr);
-            d_wqkv_nvfp4_.resize(static_cast<size_t>(L_), nullptr);
-            d_wqkv_sfb_.resize(static_cast<size_t>(L_), nullptr);
             d_wq_noise_nvfp4_.resize(static_cast<size_t>(L_), nullptr);
             d_wk_noise_nvfp4_.resize(static_cast<size_t>(L_), nullptr);
             d_wv_noise_nvfp4_.resize(static_cast<size_t>(L_), nullptr);
@@ -660,25 +894,6 @@ public:
             d_ff2_noise_sfb_.resize(static_cast<size_t>(L_), nullptr);
 
             for (int l = 0; l < L_; ++l) {
-                if (use_fused_qkv_nvfp4_) {
-                    alloc_nvfp4_b(qkv_fused_cols_, H_,
-                                  &d_wqkv_nvfp4_[static_cast<size_t>(l)],
-                                  &d_wqkv_sfb_[static_cast<size_t>(l)],
-                                  "cudaMalloc nvfp4 wqkv");
-                } else {
-                    alloc_nvfp4_b(H_, H_, &d_wq_nvfp4_[static_cast<size_t>(l)],
-                                  &d_wq_sfb_[static_cast<size_t>(l)], "cudaMalloc nvfp4 wq");
-                    alloc_nvfp4_b(H_, H_, &d_wk_nvfp4_[static_cast<size_t>(l)],
-                                  &d_wk_sfb_[static_cast<size_t>(l)], "cudaMalloc nvfp4 wk");
-                    alloc_nvfp4_b(H_, H_, &d_wv_nvfp4_[static_cast<size_t>(l)],
-                                  &d_wv_sfb_[static_cast<size_t>(l)], "cudaMalloc nvfp4 wv");
-                    alloc_nvfp4_b(1, H_, &d_wbeta_nvfp4_[static_cast<size_t>(l)],
-                                  &d_wbeta_sfb_[static_cast<size_t>(l)], "cudaMalloc nvfp4 wbeta");
-                }
-                alloc_nvfp4_b(F_, H_, &d_ff1_nvfp4_[static_cast<size_t>(l)],
-                              &d_ff1_sfb_[static_cast<size_t>(l)], "cudaMalloc nvfp4 ff1");
-                alloc_nvfp4_b(H_, F_, &d_ff2_nvfp4_[static_cast<size_t>(l)],
-                              &d_ff2_sfb_[static_cast<size_t>(l)], "cudaMalloc nvfp4 ff2");
                 alloc_nvfp4_b(H_, H_, &d_wq_noise_nvfp4_[static_cast<size_t>(l)],
                               &d_wq_noise_sfb_[static_cast<size_t>(l)], "cudaMalloc nvfp4 wq_noise");
                 alloc_nvfp4_b(H_, H_, &d_wk_noise_nvfp4_[static_cast<size_t>(l)],
@@ -883,49 +1098,11 @@ public:
         if (d_head_noise_nvfp4_) cudaFree(d_head_noise_nvfp4_);
         if (d_win_noise_nvfp4_) cudaFree(d_win_noise_nvfp4_);
         if (d_emb_noise_nvfp4_) cudaFree(d_emb_noise_nvfp4_);
-
-        for (void* p : d_ff2_sfb_) if (p) cudaFree(p);
-        for (void* p : d_ff1_sfb_) if (p) cudaFree(p);
-        for (void* p : d_wbeta_sfb_) if (p) cudaFree(p);
-        for (void* p : d_wv_sfb_) if (p) cudaFree(p);
-        for (void* p : d_wk_sfb_) if (p) cudaFree(p);
-        for (void* p : d_wq_sfb_) if (p) cudaFree(p);
-        for (void* p : d_wqkv_sfb_) if (p) cudaFree(p);
-        for (void* p : d_ff2_nvfp4_) if (p) cudaFree(p);
-        for (void* p : d_ff1_nvfp4_) if (p) cudaFree(p);
-        for (void* p : d_wbeta_nvfp4_) if (p) cudaFree(p);
-        for (void* p : d_wv_nvfp4_) if (p) cudaFree(p);
-        for (void* p : d_wk_nvfp4_) if (p) cudaFree(p);
-        for (void* p : d_wq_nvfp4_) if (p) cudaFree(p);
-        for (void* p : d_wqkv_nvfp4_) if (p) cudaFree(p);
-        if (d_head_sfb_) cudaFree(d_head_sfb_);
-        if (d_win_sfb_) cudaFree(d_win_sfb_);
-        if (d_emb_sfb_) cudaFree(d_emb_sfb_);
-        if (d_head_nvfp4_) cudaFree(d_head_nvfp4_);
-        if (d_win_nvfp4_) cudaFree(d_win_nvfp4_);
-        if (d_emb_nvfp4_) cudaFree(d_emb_nvfp4_);
         if (d_sfa_f_) cudaFree(d_sfa_f_);
         if (d_sfa_h_) cudaFree(d_sfa_h_);
         if (d_a_nvfp4_f_) cudaFree(d_a_nvfp4_f_);
         if (d_a_nvfp4_h_) cudaFree(d_a_nvfp4_h_);
 
-        if (d_head_) cudaFree(d_head_);
-        if (d_ff2_) cudaFree(d_ff2_);
-        if (d_ff1_) cudaFree(d_ff1_);
-        if (d_wbeta_) cudaFree(d_wbeta_);
-        if (d_wv_) cudaFree(d_wv_);
-        if (d_wk_) cudaFree(d_wk_);
-        if (d_wq_) cudaFree(d_wq_);
-        if (d_win_) cudaFree(d_win_);
-        if (d_emb_w_) cudaFree(d_emb_w_);
-        if (d_head_packed_) cudaFree(d_head_packed_);
-        if (d_ff2_packed_) cudaFree(d_ff2_packed_);
-        if (d_ff1_packed_) cudaFree(d_ff1_packed_);
-        if (d_wbeta_packed_) cudaFree(d_wbeta_packed_);
-        if (d_wv_packed_) cudaFree(d_wv_packed_);
-        if (d_wk_packed_) cudaFree(d_wk_packed_);
-        if (d_wq_packed_) cudaFree(d_wq_packed_);
-        if (d_win_packed_) cudaFree(d_win_packed_);
 
         if (stream_) cudaStreamDestroy(stream_);
     }
@@ -1028,6 +1205,16 @@ public:
         ff1_out_scale_ = w.ff1[0].out_scale;
         ff2_out_scale_ = w.ff2[0].out_scale;
         head_out_scale_ = w.head.out_scale;
+        if (weights_) {
+            weights_->win_out_scale = win_out_scale_;
+            weights_->q_out_scale = q_out_scale_;
+            weights_->k_out_scale = k_out_scale_;
+            weights_->v_out_scale = v_out_scale_;
+            weights_->beta_out_scale = beta_out_scale_;
+            weights_->ff1_out_scale = ff1_out_scale_;
+            weights_->ff2_out_scale = ff2_out_scale_;
+            weights_->head_out_scale = head_out_scale_;
+        }
         if (use_nvfp4_) {
             quantize_nvfp4_base_weights();
         }
@@ -1368,6 +1555,7 @@ public:
     uint32_t* d_ff1_packed() const { return d_ff1_packed_; }
     uint32_t* d_ff2_packed() const { return d_ff2_packed_; }
     uint32_t* d_head_packed() const { return d_head_packed_; }
+    bool use_packed_gemm() const { return use_packed_gemm_; }
 
     float evaluate_loss(int method,
                         int anti_sign,
@@ -2545,6 +2733,7 @@ private:
     int B_ = 0;
     int T_ = 0;
     cudaStream_t stream_ = nullptr;
+    std::shared_ptr<DeviceWeights> weights_;
 
     int8_t* d_emb_w_ = nullptr;
     int8_t* d_win_ = nullptr;
@@ -3908,10 +4097,41 @@ int main(int argc, char** argv) {
         if (cfg.gpu_workers > 1) {
             std::cout << "Workers per device: " << cfg.gpu_workers << "\n";
         }
+        std::vector<std::shared_ptr<DeviceWeights>> device_weights;
+        device_weights.reserve(devices.size());
+        std::vector<std::vector<size_t>> device_model_indices(devices.size());
+        std::vector<cudaEvent_t> update_done_events(devices.size(), nullptr);
+        for (size_t di = 0; di < devices.size(); ++di) {
+            const int dev = devices[di];
+            cuda_check(cudaSetDevice(dev), "cudaSetDevice init weights");
+            cudaDeviceProp prop{};
+            cudaGetDeviceProperties(&prop, dev);
+            const bool device_nvfp4 = (cfg.gemm_backend == TrainConfig::GemmBackend::CutlassNvfp4) && (prop.major >= 12);
+            bool device_packed = cfg.use_packed_gemm;
+            if (device_nvfp4 && device_packed) {
+                device_packed = false;
+            }
+            const bool device_fused_qkv_nvfp4 = device_nvfp4 && cfg.use_fused_qkv;
+            auto wdev = std::make_shared<DeviceWeights>(dev, cfg.vocab, cfg.hidden, cfg.layers, cfg.mlp_mult,
+                                                        cfg.batch, device_packed, device_nvfp4, device_fused_qkv_nvfp4);
+            wdev->win_out_scale = w.win.out_scale;
+            wdev->q_out_scale = w.wq[0].out_scale;
+            wdev->k_out_scale = w.wk[0].out_scale;
+            wdev->v_out_scale = w.wv[0].out_scale;
+            wdev->beta_out_scale = w.wbeta[0].out_scale;
+            wdev->ff1_out_scale = w.ff1[0].out_scale;
+            wdev->ff2_out_scale = w.ff2[0].out_scale;
+            wdev->head_out_scale = w.head.out_scale;
+            device_weights.push_back(std::move(wdev));
+            cuda_check(cudaEventCreateWithFlags(&update_done_events[di], cudaEventDisableTiming),
+                       "cudaEventCreate update_done");
+        }
+
         std::vector<std::unique_ptr<CudaEflaLm>> models;
         const int workers_per_device = std::max(1, cfg.gpu_workers);
         models.reserve(devices.size() * static_cast<size_t>(workers_per_device));
-        for (int dev : devices) {
+        for (size_t di = 0; di < devices.size(); ++di) {
+            const int dev = devices[di];
             for (int wi = 0; wi < workers_per_device; ++wi) {
                 models.emplace_back(std::make_unique<CudaEflaLm>(dev, cfg.vocab, cfg.hidden, cfg.layers, cfg.mlp_mult,
                                                                  cfg.batch, cfg.seq_len, cfg.state_dim, cfg.state_fp16,
@@ -3933,10 +4153,25 @@ int main(int argc, char** argv) {
                                                                  cfg.nvfp4_stage_count,
                                                                  cfg.nvfp4_decomp,
                                                                  cfg.nvfp4_splits,
-                                                                 cfg.noise_batch));
+                                                                 cfg.noise_batch,
+                                                                 device_weights[di]));
+                device_model_indices[di].push_back(models.size() - 1);
                 cuda_check(cudaSetDevice(dev), "cudaSetDevice init");
                 models.back()->set_pos_embedding(pos);
-                models.back()->sync_base_weights(w);
+                if (device_model_indices[di].size() == 1) {
+                    models.back()->sync_base_weights(w);
+                }
+            }
+        }
+        for (size_t di = 0; di < device_model_indices.size(); ++di) {
+            if (device_model_indices[di].empty()) continue;
+            const size_t leader_idx = device_model_indices[di][0];
+            cuda_check(cudaSetDevice(models[leader_idx]->device()), "cudaSetDevice init_wait");
+            cuda_check(cudaEventRecord(update_done_events[di], models[leader_idx]->stream()),
+                       "cudaEventRecord init_weights");
+            for (size_t mi : device_model_indices[di]) {
+                cuda_check(cudaStreamWaitEvent(models[mi]->stream(), update_done_events[di], 0),
+                           "cudaStreamWaitEvent init_weights");
             }
         }
         CudaEflaLm& model = *models.front();
@@ -3976,8 +4211,10 @@ int main(int argc, char** argv) {
             max_n = std::max(max_n, hf_size);
             max_n = std::max(max_n, h_size);
             max_n = std::max(max_n, head_size);
-            gpu_updates.resize(models.size());
-            for (size_t di = 0; di < models.size(); ++di) {
+            gpu_updates.resize(devices.size());
+            for (size_t di = 0; di < devices.size(); ++di) {
+                if (device_model_indices[di].empty()) continue;
+                const size_t leader_idx = device_model_indices[di][0];
                 GpuUpdateDevice& gu = gpu_updates[di];
                 gu.wq.resize(static_cast<size_t>(cfg.layers));
                 gu.wk.resize(static_cast<size_t>(cfg.layers));
@@ -3986,17 +4223,18 @@ int main(int argc, char** argv) {
                 gu.ff1.resize(static_cast<size_t>(cfg.layers));
                 gu.ff2.resize(static_cast<size_t>(cfg.layers));
 
-                gpu_update_ensure_buffers(*models[di], gu.buf, max_n, pairs);
-                gpu_update_alloc_shadow(*models[di], gu.emb, emb_size);
-                gpu_update_alloc_shadow(*models[di], gu.win, hh_size);
-                gpu_update_alloc_shadow(*models[di], gu.head, head_size);
+                CudaEflaLm& leader = *models[leader_idx];
+                gpu_update_ensure_buffers(leader, gu.buf, max_n, pairs);
+                gpu_update_alloc_shadow(leader, gu.emb, emb_size);
+                gpu_update_alloc_shadow(leader, gu.win, hh_size);
+                gpu_update_alloc_shadow(leader, gu.head, head_size);
                 for (int l = 0; l < cfg.layers; ++l) {
-                    gpu_update_alloc_shadow(*models[di], gu.wq[static_cast<size_t>(l)], hh_size);
-                    gpu_update_alloc_shadow(*models[di], gu.wk[static_cast<size_t>(l)], hh_size);
-                    gpu_update_alloc_shadow(*models[di], gu.wv[static_cast<size_t>(l)], hh_size);
-                    gpu_update_alloc_shadow(*models[di], gu.wbeta[static_cast<size_t>(l)], h_size);
-                    gpu_update_alloc_shadow(*models[di], gu.ff1[static_cast<size_t>(l)], hf_size);
-                    gpu_update_alloc_shadow(*models[di], gu.ff2[static_cast<size_t>(l)], hf_size);
+                    gpu_update_alloc_shadow(leader, gu.wq[static_cast<size_t>(l)], hh_size);
+                    gpu_update_alloc_shadow(leader, gu.wk[static_cast<size_t>(l)], hh_size);
+                    gpu_update_alloc_shadow(leader, gu.wv[static_cast<size_t>(l)], hh_size);
+                    gpu_update_alloc_shadow(leader, gu.wbeta[static_cast<size_t>(l)], h_size);
+                    gpu_update_alloc_shadow(leader, gu.ff1[static_cast<size_t>(l)], hf_size);
+                    gpu_update_alloc_shadow(leader, gu.ff2[static_cast<size_t>(l)], hf_size);
                 }
             }
         }
@@ -4230,11 +4468,14 @@ int main(int argc, char** argv) {
             const auto update_t0 = Clock::now();
             if (cfg.use_gpu_update) {
                 NvtxRange range_update(cfg.use_nvtx, "update_weights");
-                auto update_worker = [&](size_t di) {
-                    const int dev = models[di]->device();
+                auto update_worker = [&](size_t dev_idx) {
+                    if (device_model_indices[dev_idx].empty()) return;
+                    const size_t leader_idx = device_model_indices[dev_idx][0];
+                    const int dev = models[leader_idx]->device();
                     cuda_check(cudaSetDevice(dev), "cudaSetDevice update_worker");
-                    CudaEflaLm& worker = *models[di];
-                    GpuUpdateDevice& gu = gpu_updates[di];
+                    CudaEflaLm& worker = *models[leader_idx];
+                    GpuUpdateDevice& gu = gpu_updates[dev_idx];
+                    const bool use_packed = worker.use_packed_gemm();
 
                     gpu_update_upload_pair_weights(worker, gu.buf, weights);
                     gpu_update_fill_pair_seeds(worker, gu.buf, cfg.seed,
@@ -4245,7 +4486,7 @@ int main(int argc, char** argv) {
                                       nullptr);
                     gpu_update_matrix(worker, gu.buf, gu.win, cfg, kSaltWin,
                                       lr_t, thresh_t, worker.d_win_w(), hh_size, pairs,
-                                      cfg.use_packed_gemm ? worker.d_win_packed() : nullptr);
+                                      use_packed ? worker.d_win_packed() : nullptr);
                     for (int l = 0; l < cfg.layers; ++l) {
                         const uint64_t lq = rng::mix(static_cast<uint64_t>(l), kSaltWq);
                         const uint64_t lk = rng::mix(static_cast<uint64_t>(l), kSaltWk);
@@ -4263,43 +4504,49 @@ int main(int argc, char** argv) {
                         gpu_update_matrix(worker, gu.buf, gu.wq[static_cast<size_t>(l)],
                                           cfg, lq,
                                           lr_t, thresh_t, worker.d_wq_w() + off_hh, hh_size, pairs,
-                                          cfg.use_packed_gemm ? (worker.d_wq_packed() + off_hh_p) : nullptr);
+                                          use_packed ? (worker.d_wq_packed() + off_hh_p) : nullptr);
                         gpu_update_matrix(worker, gu.buf, gu.wk[static_cast<size_t>(l)],
                                           cfg, lk,
                                           lr_t, thresh_t, worker.d_wk_w() + off_hh, hh_size, pairs,
-                                          cfg.use_packed_gemm ? (worker.d_wk_packed() + off_hh_p) : nullptr);
+                                          use_packed ? (worker.d_wk_packed() + off_hh_p) : nullptr);
                         gpu_update_matrix(worker, gu.buf, gu.wv[static_cast<size_t>(l)],
                                           cfg, lv,
                                           lr_t, thresh_t, worker.d_wv_w() + off_hh, hh_size, pairs,
-                                          cfg.use_packed_gemm ? (worker.d_wv_packed() + off_hh_p) : nullptr);
+                                          use_packed ? (worker.d_wv_packed() + off_hh_p) : nullptr);
                         gpu_update_matrix(worker, gu.buf, gu.wbeta[static_cast<size_t>(l)],
                                           cfg, lb,
                                           lr_t, thresh_t, worker.d_wbeta_w() + off_h, h_size, pairs,
-                                          cfg.use_packed_gemm ? (worker.d_wbeta_packed() + off_h_p) : nullptr);
+                                          use_packed ? (worker.d_wbeta_packed() + off_h_p) : nullptr);
                         gpu_update_matrix(worker, gu.buf, gu.ff1[static_cast<size_t>(l)],
                                           cfg, lff1,
                                           lr_t, thresh_t, worker.d_ff1_w() + off_hf, hf_size, pairs,
-                                          cfg.use_packed_gemm ? (worker.d_ff1_packed() + off_hf1_p) : nullptr);
+                                          use_packed ? (worker.d_ff1_packed() + off_hf1_p) : nullptr);
                         gpu_update_matrix(worker, gu.buf, gu.ff2[static_cast<size_t>(l)],
                                           cfg, lff2,
                                           lr_t, thresh_t, worker.d_ff2_w() + off_hf, hf_size, pairs,
-                                          cfg.use_packed_gemm ? (worker.d_ff2_packed() + off_hf2_p) : nullptr);
+                                          use_packed ? (worker.d_ff2_packed() + off_hf2_p) : nullptr);
                     }
                     gpu_update_matrix(worker, gu.buf, gu.head, cfg, kSaltHead,
                                       lr_t, thresh_t, worker.d_head_w(), head_size, pairs,
-                                      cfg.use_packed_gemm ? worker.d_head_packed() : nullptr);
-                    if (cfg.use_packed_gemm && !cfg.use_packed_update) {
+                                      use_packed ? worker.d_head_packed() : nullptr);
+                    if (use_packed && !cfg.use_packed_update) {
                         worker.pack_base_weights();
                     }
                     worker.quantize_nvfp4_base_weights();
+                    cuda_check(cudaEventRecord(update_done_events[dev_idx], worker.stream()),
+                               "cudaEventRecord update_done");
+                    for (size_t mi : device_model_indices[dev_idx]) {
+                        cuda_check(cudaStreamWaitEvent(models[mi]->stream(), update_done_events[dev_idx], 0),
+                                   "cudaStreamWaitEvent update_done");
+                    }
                 };
 
-                if (models.size() == 1) {
+                if (devices.size() == 1) {
                     update_worker(0);
                 } else {
                     std::vector<std::thread> threads;
-                    threads.reserve(models.size());
-                    for (size_t di = 0; di < models.size(); ++di) {
+                    threads.reserve(devices.size());
+                    for (size_t di = 0; di < devices.size(); ++di) {
                         threads.emplace_back(update_worker, di);
                     }
                     for (auto& t : threads) t.join();
@@ -4356,9 +4603,17 @@ int main(int argc, char** argv) {
 
                 {
                     NvtxRange range_sync(cfg.use_nvtx, "sync_weights");
-                    for (size_t di = 0; di < models.size(); ++di) {
-                        cuda_check(cudaSetDevice(models[di]->device()), "cudaSetDevice sync_base_weights");
-                        models[di]->sync_base_weights(w);
+                    for (size_t di = 0; di < device_model_indices.size(); ++di) {
+                        if (device_model_indices[di].empty()) continue;
+                        const size_t leader_idx = device_model_indices[di][0];
+                        cuda_check(cudaSetDevice(models[leader_idx]->device()), "cudaSetDevice sync_base_weights");
+                        models[leader_idx]->sync_base_weights(w);
+                        cuda_check(cudaEventRecord(update_done_events[di], models[leader_idx]->stream()),
+                                   "cudaEventRecord sync_weights");
+                        for (size_t mi : device_model_indices[di]) {
+                            cuda_check(cudaStreamWaitEvent(models[mi]->stream(), update_done_events[di], 0),
+                                       "cudaStreamWaitEvent sync_weights");
+                        }
                     }
                 }
             }
@@ -4452,20 +4707,28 @@ int main(int argc, char** argv) {
 
         if (cfg.use_gpu_update) {
             for (size_t di = 0; di < gpu_updates.size(); ++di) {
+                if (device_model_indices[di].empty()) continue;
+                const size_t leader_idx = device_model_indices[di][0];
+                const int dev = models[leader_idx]->device();
                 GpuUpdateDevice& gu = gpu_updates[di];
-                gpu_update_free_buffers(models[di]->device(), gu.buf);
-                gpu_update_free_matrix(models[di]->device(), gu.emb);
-                gpu_update_free_matrix(models[di]->device(), gu.win);
-                gpu_update_free_matrix(models[di]->device(), gu.head);
+                gpu_update_free_buffers(dev, gu.buf);
+                gpu_update_free_matrix(dev, gu.emb);
+                gpu_update_free_matrix(dev, gu.win);
+                gpu_update_free_matrix(dev, gu.head);
                 for (size_t l = 0; l < gu.wq.size(); ++l) {
-                    gpu_update_free_matrix(models[di]->device(), gu.wq[l]);
-                    gpu_update_free_matrix(models[di]->device(), gu.wk[l]);
-                    gpu_update_free_matrix(models[di]->device(), gu.wv[l]);
-                    gpu_update_free_matrix(models[di]->device(), gu.wbeta[l]);
-                    gpu_update_free_matrix(models[di]->device(), gu.ff1[l]);
-                    gpu_update_free_matrix(models[di]->device(), gu.ff2[l]);
+                    gpu_update_free_matrix(dev, gu.wq[l]);
+                    gpu_update_free_matrix(dev, gu.wk[l]);
+                    gpu_update_free_matrix(dev, gu.wv[l]);
+                    gpu_update_free_matrix(dev, gu.wbeta[l]);
+                    gpu_update_free_matrix(dev, gu.ff1[l]);
+                    gpu_update_free_matrix(dev, gu.ff2[l]);
                 }
             }
+        }
+        for (size_t di = 0; di < update_done_events.size(); ++di) {
+            if (!update_done_events[di]) continue;
+            cuda_check(cudaSetDevice(devices[di]), "cudaSetDevice destroy update_done");
+            cudaEventDestroy(update_done_events[di]);
         }
     } catch (const std::exception& e) {
         std::cerr << "Fatal: " << e.what() << "\n";
