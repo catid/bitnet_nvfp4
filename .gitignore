@@ -1,0 +1,15 @@
+# build outputs
+build/
+
+# local results/logs
+*.log
+
+# data files (downloaded)
+data/*.txt
+
+# common temp files
+*.tmp
+*.swp
+*.swo
+*.pyc
+__pycache__/
