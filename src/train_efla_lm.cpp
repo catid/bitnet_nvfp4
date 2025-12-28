@@ -191,13 +191,13 @@ struct TrainConfig {
     int epochs = 50;
     int population = 2048; // even
     int batch = 32;
-    int seq_len = 64;
+    int seq_len = 128;
     int hidden = 512;
     int layers = 4;
     int mlp_mult = 2;
     int vocab = 256;
     int sigma_shift = 3;
-    int sigma_shift_end = -1;
+    int sigma_shift_end = 4;
     int state_dim = 0; // 0 = full HxH state, >0 = low-rank D x H state
 
     bool use_clt_noise = true; // CLT/approx-Gaussian perturbations
@@ -226,13 +226,13 @@ struct TrainConfig {
     bool noise_batch = true;
     bool use_pinned_tokens = true;
 
-    float update_threshold = 0.08f;
-    float update_threshold_end = -1.0f;
+    float update_threshold = 0.008f;
+    float update_threshold_end = 0.008f;
 
-    float lr = 0.15f;     // optimizer lr / step size
-    float lr_end = -1.0f; // optional schedule target
+    float lr = 0.80f;     // optimizer lr / step size
+    float lr_end = 0.05f; // optional schedule target
 
-    float act_scale = 1.0f; // applied after GELU before quantize
+    float act_scale = 0.8f; // applied after GELU before quantize
     float mlp_act_scale = 1.0f; // applied after GELU in MLP before quantize
     float ln_scale = 1.0f;  // applied after LayerNorm before quantize
     float residual_scale = 1.0f; // L==1: scales x in LN(attn(x)+s*x); L>=2: scales attn in x += s*attn(LN(x))
@@ -261,9 +261,9 @@ struct TrainConfig {
 
     enum class GemmBackend { Dp4a = 0, Cutlass = 1, CutlassNvfp4 = 2 };
     GemmBackend gemm_backend = GemmBackend::CutlassNvfp4;
-    bitnet_cuda::Nvfp4Schedule nvfp4_schedule = bitnet_cuda::Nvfp4Schedule::Auto;
+    bitnet_cuda::Nvfp4Schedule nvfp4_schedule = bitnet_cuda::Nvfp4Schedule::Cooperative;
     bitnet_cuda::Nvfp4QuantMode nvfp4_quant_mode = bitnet_cuda::Nvfp4QuantMode::Warp16;
-    bitnet_cuda::Nvfp4StageCount nvfp4_stage_count = bitnet_cuda::Nvfp4StageCount::Auto;
+    bitnet_cuda::Nvfp4StageCount nvfp4_stage_count = bitnet_cuda::Nvfp4StageCount::Stages2;
     bitnet_cuda::Nvfp4Decomposition nvfp4_decomp = bitnet_cuda::Nvfp4Decomposition::SplitK;
     int nvfp4_splits = 2;
     bool nvfp4_autotune = false;
@@ -275,12 +275,12 @@ struct TrainConfig {
 
     enum class Schedule { Constant = 0, Linear = 1, Cosine = 2, Exp = 3 };
     Schedule lr_schedule = Schedule::Cosine;
-    Schedule thresh_schedule = Schedule::Cosine;
-    Schedule sigma_schedule = Schedule::Constant;
+    Schedule thresh_schedule = Schedule::Exp;
+    Schedule sigma_schedule = Schedule::Exp;
 
     bool state_fp16 = true;
 
-    bool train_pos = false;
+    bool train_pos = true;
     float pos_lr_mult = 1.0f;
     float pos_thresh_mult = 1.0f;
 
@@ -4350,9 +4350,9 @@ int main(int argc, char** argv) {
     bool sigma_specified = false;
     bool act_scale_specified = false;
     bool mlp_act_scale_specified = false;
-    bool nvfp4_schedule_specified = false;
+    bool nvfp4_schedule_specified = (cfg.nvfp4_schedule != bitnet_cuda::Nvfp4Schedule::Auto);
     bool nvfp4_quant_specified = false;
-    bool nvfp4_stage_specified = false;
+    bool nvfp4_stage_specified = (cfg.nvfp4_stage_count != bitnet_cuda::Nvfp4StageCount::Auto);
     bool nvfp4_decomp_specified = false;
     bool nvfp4_splits_specified = false;
     bool nvfp4_autotune_specified = false;
@@ -4526,21 +4526,21 @@ int main(int argc, char** argv) {
                 "  --epochs N         epochs (default 50)\n"
                 "  --pop N            ES population (even, default 2048)\n"
                 "  --batch N          batch size (default 32)\n"
-                "  --seq N            sequence length (default 64)\n"
+                "  --seq N            sequence length (default 128)\n"
                 "  --hidden H         hidden dim (default 512)\n"
                 "  --layers L         number of EFLA blocks (default 4)\n"
                 "  --mlp_mult M       MLP expansion ratio (default 2)\n"
                 "  --model_8m         preset ~8M params (hidden=416, layers=4, mlp_mult=4)\n"
-                "                    + tuned defaults if not overridden: lr=0.24, thresh=0.10,\n"
-                "                      sigma_shift=3, act_scale=0.8, mlp_act_scale=1.0,\n"
-                "                      lr_end=0.05, lr_schedule=exp\n"
+                "                    + tuned defaults if not overridden: lr=0.80, thresh=0.008,\n"
+                "                      thresh_end=0.008, sigma_shift=3->4, lr_schedule=cosine,\n"
+                "                      act_scale=0.8, mlp_act_scale=1.0, lr_end=0.05\n"
                 "  --sigma_shift S    noise scale 1/2^S (default 3)\n"
-                "  --sigma_shift_end S end sigma_shift (optional)\n"
-                "  --sigma_schedule {constant|linear|cosine|exp}\n"
+                "  --sigma_shift_end S end sigma_shift (default 4)\n"
+                "  --sigma_schedule {constant|linear|cosine|exp} (default exp)\n"
                 "  --state_dim D      low-rank state dim (0 = full HxH state)\n"
                 "  --state_fp16       store EFLA state in FP16 (default on)\n"
                 "  --no_state_fp16    store EFLA state in FP32\n"
-                "  --train_pos        train positional embeddings (default off)\n"
+                "  --train_pos        train positional embeddings (default on)\n"
                 "  --no_train_pos     keep positional embeddings fixed\n"
                 "  --pos_lr_mult X    scale lr for pos embeddings (default 1.0)\n"
                 "  --pos_thresh_mult X scale thresh for pos embeddings (default 1.0)\n"
@@ -4576,9 +4576,9 @@ int main(int argc, char** argv) {
                 "  --gemm_backend {dp4a|cutlass|nvfp4} (default nvfp4)\n"
                 "  --cutlass_gemm   use CUTLASS GEMM (unpacked only)\n"
                 "  --cutlass_nvfp4  use CUTLASS NVFP4 block-scaled GEMM (sm120+, hidden%128==0)\n"
-                "  --nvfp4_schedule {auto|cooperative|pingpong} (default auto)\n"
+                "  --nvfp4_schedule {auto|cooperative|pingpong} (default cooperative)\n"
                 "  --nvfp4_quant {warp16|warp4} (default warp16)\n"
-                "  --nvfp4_stages {auto|2|3|4} (default auto)\n"
+                "  --nvfp4_stages {auto|2|3|4} (default 2)\n"
                 "  --nvfp4_decomp {auto|data|splitk|streamk} (default splitk)\n"
                 "  --nvfp4_splits N  split-K factor for nvfp4 (default 2)\n"
                 "  --nvfp4_autotune enable nvfp4 tuning for unset options (default off)\n"
@@ -4602,12 +4602,12 @@ int main(int argc, char** argv) {
                 "  --clt/--no_clt     use CLT/approx-Gaussian noise (default on)\n"
                 "  --clt_k K          CLT sum terms (default 4)\n"
                 "  --omp_threads N    set OpenMP thread count (default 0 = auto/all cores)\n"
-                "  --thresh T         update threshold (default 0.08)\n"
-                "  --thresh_end T     end threshold (optional)\n"
-                "  --thresh_schedule {constant|linear|cosine|exp}\n"
-                "  --lr LR            optimizer lr / step size (default 0.15)\n"
-                "  --lr_end LR        end lr (optional)\n"
-                "  --lr_schedule {constant|linear|cosine|exp}\n"
+                "  --thresh T         update threshold (default 0.008)\n"
+                "  --thresh_end T     end threshold (default 0.008)\n"
+                "  --thresh_schedule {constant|linear|cosine|exp} (default exp)\n"
+                "  --lr LR            optimizer lr / step size (default 0.80)\n"
+                "  --lr_end LR        end lr (default 0.05)\n"
+                "  --lr_schedule {constant|linear|cosine|exp} (default cosine)\n"
                 "  --fitness {sign|zscore|centered_rank}\n"
                 "  --fitness_clip C   clip for zscore/rank (default 3)\n"
                 "  --shadow/--no_shadow    float shadow weights (default on)\n"
@@ -4619,7 +4619,7 @@ int main(int argc, char** argv) {
                 "  --adaptive/--no_adaptive adaptive RMS scaling (default on)\n"
                 "  --adaptive_beta B   adaptive ema beta\n"
                 "  --adaptive_eps E    adaptive eps\n"
-                "  --act_scale S       scale after GELU (default 1)\n"
+                "  --act_scale S       scale after GELU (default 0.8)\n"
                 "  --mlp_act_scale S   scale after GELU in MLP (default 1)\n"
                 "  --ln_scale S        scale after LayerNorm (default 1)\n"
                 "  --residual_scale S  residual scale (L==1: scales x; L>=2: scales attn) (default 1)\n"
@@ -4702,10 +4702,10 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (model_8m_requested) {
-        if (!lr_specified) cfg.lr = 0.24f;
+        if (!lr_specified) cfg.lr = 0.80f;
         if (!lr_end_specified) cfg.lr_end = 0.05f;
-        if (!lr_schedule_specified) cfg.lr_schedule = TrainConfig::Schedule::Exp;
-        if (!thresh_specified) cfg.update_threshold = 0.10f;
+        if (!lr_schedule_specified) cfg.lr_schedule = TrainConfig::Schedule::Cosine;
+        if (!thresh_specified) cfg.update_threshold = 0.008f;
         if (!sigma_specified) cfg.sigma_shift = 3;
         if (!act_scale_specified) cfg.act_scale = 0.8f;
         if (!mlp_act_scale_specified) cfg.mlp_act_scale = 1.0f;
