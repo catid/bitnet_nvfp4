@@ -216,6 +216,40 @@ void efla_step_half(__half* d_S,
                     float* d_alpha,
                     cudaStream_t stream);
 
+// EFLA step for fused QKV layout (row-major qkv with stride fused_cols).
+// Only supports the standard (non-fused-diff, non-mixed, non-wmma) path.
+void efla_step_qkv_fused(float* d_S,
+                         const float* d_qkv,
+                         int fused_cols,
+                         float beta_bias,
+                         int hidden,
+                         int batch,
+                         int method,
+                         float eps,
+                         float* d_out,
+                         float* d_q_norm,
+                         float* d_k_usage,
+                         float* d_kS,
+                         float* d_diff,
+                         float* d_alpha,
+                         cudaStream_t stream);
+
+void efla_step_half_qkv_fused(__half* d_S,
+                              const float* d_qkv,
+                              int fused_cols,
+                              float beta_bias,
+                              int hidden,
+                              int batch,
+                              int method,
+                              float eps,
+                              float* d_out,
+                              float* d_q_norm,
+                              float* d_k_usage,
+                              float* d_kS,
+                              float* d_diff,
+                              float* d_alpha,
+                              cudaStream_t stream);
+
 // One-kernel fused EFLA step (uses shared memory, no scratch buffers).
 void efla_step_fused(float* d_S,
                      const float* d_q,

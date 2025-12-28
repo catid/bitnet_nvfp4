@@ -686,7 +686,7 @@ public:
           use_nvtx_(use_nvtx),
           use_fused_qkv_(use_fused_qkv),
           use_qkv_split_kernel_(use_qkv_split_kernel),
-          use_qkv_split_vec4_(qkv_split_vec4 < 0 ? (hidden <= 256) : (qkv_split_vec4 != 0)),
+          use_qkv_split_vec4_(qkv_split_vec4 < 0 ? ((hidden & 3) == 0) : (qkv_split_vec4 != 0)),
           use_qkv_split_bias_(use_qkv_split_bias),
           use_fused_ff1_(use_fused_ff1),
           use_fused_head_loss_(use_fused_head_loss),
@@ -2131,7 +2131,22 @@ public:
             (gemm_backend_ == TrainConfig::GemmBackend::Dp4a) &&
             (V_ <= 256);
 
-        auto efla_full_state = [&](float* d_S_f, __half* d_S_h, float beta_bias_eff, float* d_out) {
+        auto efla_full_state = [&](float* d_S_f, __half* d_S_h, float beta_bias_eff, float* d_out,
+                                   const float* d_qkv, int fused_cols, bool use_qkv_fused_layout) {
+            if (use_qkv_fused_layout) {
+                if (use_fp16_state_) {
+                    efla_lm_cuda::efla_step_half_qkv_fused(d_S_h, d_qkv, fused_cols, beta_bias_eff,
+                                                          H_, B_, method, eps,
+                                                          d_out, d_q_norm_, d_k_usage_, d_kS_, d_diff_, d_alpha_,
+                                                          stream_);
+                } else {
+                    efla_lm_cuda::efla_step_qkv_fused(d_S_f, d_qkv, fused_cols, beta_bias_eff,
+                                                     H_, B_, method, eps,
+                                                     d_out, d_q_norm_, d_k_usage_, d_kS_, d_diff_, d_alpha_,
+                                                     stream_);
+                }
+                return;
+            }
             if (use_fused_efla_) {
                 if (use_fp16_state_) {
                     efla_lm_cuda::efla_step_fused_half(d_S_h, d_q_, d_k_, d_v_, d_beta_raw_, beta_bias_eff,
@@ -2425,6 +2440,7 @@ public:
                                  float b_scale,
                                  float beta_bias_eff,
                                  bool fuse_beta_bias,
+                                 bool skip_split,
                                  float* d_q,
                                  float* d_k,
                                  float* d_v,
@@ -2476,37 +2492,39 @@ public:
                                                                   stream_);
                                 fused_noise = true;
                             }
-                            if (use_qkv_split_kernel_) {
-                                const float bias = fuse_beta_bias ? beta_bias_eff : 0.0f;
-                                bitnet_cuda::split_qkvb_fused(d_qkv_f_, B_, rows, fused_rows, d_q, d_k, d_v, d_beta,
-                                                              bias, use_qkv_split_vec4_, stream_);
-                            } else {
-                                const size_t src_pitch = static_cast<size_t>(fused_rows) * sizeof(float);
-                                const size_t dst_pitch = static_cast<size_t>(rows) * sizeof(float);
-                                cuda_check(cudaMemcpy2DAsync(d_q, dst_pitch,
-                                                             d_qkv_f_, src_pitch,
-                                                             static_cast<size_t>(rows) * sizeof(float),
-                                                             B_,
-                                                             cudaMemcpyDeviceToDevice,
-                                                             stream_), "cudaMemcpy2DAsync q");
-                                cuda_check(cudaMemcpy2DAsync(d_k, dst_pitch,
-                                                             d_qkv_f_ + rows, src_pitch,
-                                                             static_cast<size_t>(rows) * sizeof(float),
-                                                             B_,
-                                                             cudaMemcpyDeviceToDevice,
-                                                             stream_), "cudaMemcpy2DAsync k");
-                                cuda_check(cudaMemcpy2DAsync(d_v, dst_pitch,
-                                                             d_qkv_f_ + rows * 2, src_pitch,
-                                                             static_cast<size_t>(rows) * sizeof(float),
-                                                             B_,
-                                                             cudaMemcpyDeviceToDevice,
-                                                             stream_), "cudaMemcpy2DAsync v");
-                                cuda_check(cudaMemcpy2DAsync(d_beta, sizeof(float),
-                                                             d_qkv_f_ + rows * 3, src_pitch,
-                                                             sizeof(float),
-                                                             B_,
-                                                             cudaMemcpyDeviceToDevice,
-                                                             stream_), "cudaMemcpy2DAsync beta");
+                            if (!skip_split) {
+                                if (use_qkv_split_kernel_) {
+                                    const float bias = fuse_beta_bias ? beta_bias_eff : 0.0f;
+                                    bitnet_cuda::split_qkvb_fused(d_qkv_f_, B_, rows, fused_rows, d_q, d_k, d_v, d_beta,
+                                                                  bias, use_qkv_split_vec4_, stream_);
+                                } else {
+                                    const size_t src_pitch = static_cast<size_t>(fused_rows) * sizeof(float);
+                                    const size_t dst_pitch = static_cast<size_t>(rows) * sizeof(float);
+                                    cuda_check(cudaMemcpy2DAsync(d_q, dst_pitch,
+                                                                 d_qkv_f_, src_pitch,
+                                                                 static_cast<size_t>(rows) * sizeof(float),
+                                                                 B_,
+                                                                 cudaMemcpyDeviceToDevice,
+                                                                 stream_), "cudaMemcpy2DAsync q");
+                                    cuda_check(cudaMemcpy2DAsync(d_k, dst_pitch,
+                                                                 d_qkv_f_ + rows, src_pitch,
+                                                                 static_cast<size_t>(rows) * sizeof(float),
+                                                                 B_,
+                                                                 cudaMemcpyDeviceToDevice,
+                                                                 stream_), "cudaMemcpy2DAsync k");
+                                    cuda_check(cudaMemcpy2DAsync(d_v, dst_pitch,
+                                                                 d_qkv_f_ + rows * 2, src_pitch,
+                                                                 static_cast<size_t>(rows) * sizeof(float),
+                                                                 B_,
+                                                                 cudaMemcpyDeviceToDevice,
+                                                                 stream_), "cudaMemcpy2DAsync v");
+                                    cuda_check(cudaMemcpy2DAsync(d_beta, sizeof(float),
+                                                                 d_qkv_f_ + rows * 3, src_pitch,
+                                                                 sizeof(float),
+                                                                 B_,
+                                                                 cudaMemcpyDeviceToDevice,
+                                                                 stream_), "cudaMemcpy2DAsync beta");
+                                }
                             }
                         } else {
                             const float* d_c = d_q;
@@ -2690,20 +2708,23 @@ public:
                 NvtxRange range_token(use_nvtx_ && !use_cuda_graph_, "token");
                 const uint8_t* d_tokens_t = d_tokens_active_ + t;
 
-                // emb_f: float, including optional full noise.
-                efla_lm_cuda::embedding_lookup_noise(d_tokens_t, T_,
-                                                     d_emb_w_, (noise_active ? d_emb_noise_ : nullptr),
-                                                     H_, B_,
-                                                     noise_scale, anti_sign,
-                                                     d_emb_f_, stream_);
-
-                // emb_q: quantized int8 embedding (optionally fused with NVFP4 quantization).
                 if (use_nvfp4) {
-                    bitnet_cuda::activation_quantize_nvfp4(d_emb_f_, B_, H_, H_, /*activation*/0,
-                                                           d_emb_q_, d_a_nvfp4_h_, d_sfa_h_, stream_);
+                    bitnet_cuda::embedding_lookup_noise_quantize_nvfp4(d_tokens_t, T_,
+                                                                       d_emb_w_, (noise_active ? d_emb_noise_ : nullptr),
+                                                                       H_, B_,
+                                                                       noise_scale, anti_sign,
+                                                                       d_emb_q_, d_a_nvfp4_h_, d_sfa_h_, stream_);
                     bump_version(d_emb_q_);
                     set_nvfp4_act(d_emb_q_, H_);
                 } else {
+                    // emb_f: float, including optional full noise.
+                    efla_lm_cuda::embedding_lookup_noise(d_tokens_t, T_,
+                                                         d_emb_w_, (noise_active ? d_emb_noise_ : nullptr),
+                                                         H_, B_,
+                                                         noise_scale, anti_sign,
+                                                         d_emb_f_, stream_);
+
+                    // emb_q: quantized int8 embedding.
                     bitnet_cuda::activation_quantize(d_emb_f_, d_emb_q_, B_ * H_, /*activation*/0, stream_);
                     bump_version(d_emb_q_);
                 }
@@ -2722,14 +2743,30 @@ public:
                 const float* d_pos_t = d_pos_ + static_cast<size_t>(t) * H_;
                 if (use_transformer_residual) {
                     if (int8_residual) {
-                        efla_lm_cuda::add_pos_gelu_quantize(d_inproj_f_, d_pos_t, H_, B_, act_scale, d_x_q_, stream_);
+                        if (use_nvfp4) {
+                            bitnet_cuda::add_pos_gelu_quantize_nvfp4(d_inproj_f_, d_pos_t, H_, B_, act_scale,
+                                                                     d_x_q_, d_a_nvfp4_h_, d_sfa_h_, stream_);
+                        } else {
+                            efla_lm_cuda::add_pos_gelu_quantize(d_inproj_f_, d_pos_t, H_, B_, act_scale, d_x_q_, stream_);
+                        }
                         bump_version(d_x_q_);
+                        if (use_nvfp4) {
+                            set_nvfp4_act(d_x_q_, H_);
+                        }
                     } else {
                         efla_lm_cuda::add_pos_gelu(d_inproj_f_, d_pos_t, H_, B_, act_scale, d_res_f_, stream_);
                     }
                 } else {
-                    efla_lm_cuda::add_pos_gelu_quantize(d_inproj_f_, d_pos_t, H_, B_, act_scale, d_x_q_, stream_);
+                    if (use_nvfp4) {
+                        bitnet_cuda::add_pos_gelu_quantize_nvfp4(d_inproj_f_, d_pos_t, H_, B_, act_scale,
+                                                                 d_x_q_, d_a_nvfp4_h_, d_sfa_h_, stream_);
+                    } else {
+                        efla_lm_cuda::add_pos_gelu_quantize(d_inproj_f_, d_pos_t, H_, B_, act_scale, d_x_q_, stream_);
+                    }
                     bump_version(d_x_q_);
+                    if (use_nvfp4) {
+                        set_nvfp4_act(d_x_q_, H_);
+                    }
                 }
 
                 const size_t hh = static_cast<size_t>(H_) * H_;
@@ -2739,12 +2776,15 @@ public:
                 if (use_transformer_residual) {
                     if (int8_residual) {
                         NvtxRange range_attn(use_nvtx_ && !use_cuda_graph_, "attn");
+                        bool have_normed_x = false;
                         for (int l = 0; l < L_; ++l) {
                             if (use_nvfp4) {
-                                bitnet_cuda::absmean_norm_q_nvfp4(d_x_q_, H_, B_, H_, ln_scale,
-                                                                  d_y_q_, d_a_nvfp4_h_, d_sfa_h_, stream_);
-                                bump_version(d_y_q_);
-                                set_nvfp4_act(d_y_q_, H_);
+                                if (!have_normed_x) {
+                                    bitnet_cuda::absmean_norm_q_nvfp4(d_x_q_, H_, B_, H_, ln_scale,
+                                                                      d_y_q_, d_a_nvfp4_h_, d_sfa_h_, stream_);
+                                    bump_version(d_y_q_);
+                                    set_nvfp4_act(d_y_q_, H_);
+                                }
                             } else {
                                 efla_lm_cuda::absmean_norm_q(d_x_q_, H_, B_, ln_scale, d_y_q_, stream_);
                                 bump_version(d_y_q_);
@@ -2820,9 +2860,13 @@ public:
                                                         : 0.0f;
                             const float beta_bias_eff =
                                 bb_base + static_cast<float>(anti_sign) * noise_scale * bb_noise;
+                            const bool use_qkv_fused_layout =
+                                use_nvfp4 && use_fused_qkv_nvfp4_ && wqkv_nvfp4 && wqkv_sfb && d_qkv_f_ &&
+                                (D_ == 0) && !use_fused_efla_ && !use_efla_mixed_ &&
+                                !use_efla_fuse_diff_ && !use_efla_update_wmma_;
                             const bool fuse_beta_bias =
                                 use_qkv_split_bias_ && use_nvfp4 && use_fused_qkv_nvfp4_ && use_qkv_split_kernel_ &&
-                                wqkv_nvfp4 && wqkv_sfb && d_qkv_f_;
+                                wqkv_nvfp4 && wqkv_sfb && d_qkv_f_ && !use_qkv_fused_layout;
                             const float beta_bias_for_step = fuse_beta_bias ? 0.0f : beta_bias_eff;
 
                             gemm_qkvb(d_y_q_,
@@ -2838,7 +2882,7 @@ public:
                                       wqkv_noise_nvfp4, wqkv_noise_sfb,
                                       d_scale_x_, H_, H_,
                                       q_out_scale_, k_out_scale_, v_out_scale_, beta_out_scale_,
-                                      beta_bias_eff, fuse_beta_bias,
+                                      beta_bias_eff, fuse_beta_bias, use_qkv_fused_layout,
                                       d_q_, d_k_, d_v_, d_beta_raw_);
                             if (D_ > 0) {
                                 float* d_K_l = d_K_f_ + static_cast<size_t>(l) * static_cast<size_t>(B_) * dh;
@@ -2854,7 +2898,8 @@ public:
                                 __half* d_S_h = use_fp16_state_
                                                     ? (d_S_h_ + static_cast<size_t>(l) * static_cast<size_t>(B_) * hh)
                                                     : nullptr;
-                                efla_full_state(d_S_f, d_S_h, beta_bias_for_step, d_y_);
+                                efla_full_state(d_S_f, d_S_h, beta_bias_for_step, d_y_,
+                                                d_qkv_f_, qkv_fused_cols_, use_qkv_fused_layout);
                             }
                             NvtxRange range_mlp(use_nvtx_ && !use_cuda_graph_, "mlp");
                             if (use_nvfp4) {
@@ -2883,15 +2928,27 @@ public:
                                        wf2_nvfp4, wf2_sfb,
                                        wf2_noise_nvfp4, wf2_noise_sfb,
                                        H_, F_, ff2_out_scale_, d_y_);
-                            efla_lm_cuda::add_scaled_to_int8(d_x_q_, d_y_, B_ * H_, mlp_residual_scale, stream_);
-                            bump_version(d_x_q_);
+                            if (use_nvfp4) {
+                                bitnet_cuda::add_scaled_to_int8_absmean_norm_q_nvfp4(
+                                    d_x_q_, d_y_, H_, B_, H_, mlp_residual_scale, ln_scale,
+                                    d_y_q_, d_a_nvfp4_h_, d_sfa_h_, stream_);
+                                bump_version(d_x_q_);
+                                bump_version(d_y_q_);
+                                set_nvfp4_act(d_y_q_, H_);
+                                have_normed_x = true;
+                            } else {
+                                efla_lm_cuda::add_scaled_to_int8(d_x_q_, d_y_, B_ * H_, mlp_residual_scale, stream_);
+                                bump_version(d_x_q_);
+                            }
                         }
 
                         if (use_nvfp4) {
-                            bitnet_cuda::absmean_norm_q_nvfp4(d_x_q_, H_, B_, H_, ln_scale,
-                                                              d_y_q_, d_a_nvfp4_h_, d_sfa_h_, stream_);
-                            bump_version(d_y_q_);
-                            set_nvfp4_act(d_y_q_, H_);
+                            if (!have_normed_x) {
+                                bitnet_cuda::absmean_norm_q_nvfp4(d_x_q_, H_, B_, H_, ln_scale,
+                                                                  d_y_q_, d_a_nvfp4_h_, d_sfa_h_, stream_);
+                                bump_version(d_y_q_);
+                                set_nvfp4_act(d_y_q_, H_);
+                            }
                         } else {
                             efla_lm_cuda::absmean_norm_q(d_x_q_, H_, B_, ln_scale, d_y_q_, stream_);
                             bump_version(d_y_q_);
@@ -2973,9 +3030,13 @@ public:
                                                         : 0.0f;
                             const float beta_bias_eff =
                                 bb_base + static_cast<float>(anti_sign) * noise_scale * bb_noise;
+                            const bool use_qkv_fused_layout =
+                                use_nvfp4 && use_fused_qkv_nvfp4_ && wqkv_nvfp4 && wqkv_sfb && d_qkv_f_ &&
+                                (D_ == 0) && !use_fused_efla_ && !use_efla_mixed_ &&
+                                !use_efla_fuse_diff_ && !use_efla_update_wmma_;
                             const bool fuse_beta_bias =
                                 use_qkv_split_bias_ && use_nvfp4 && use_fused_qkv_nvfp4_ && use_qkv_split_kernel_ &&
-                                wqkv_nvfp4 && wqkv_sfb && d_qkv_f_;
+                                wqkv_nvfp4 && wqkv_sfb && d_qkv_f_ && !use_qkv_fused_layout;
                             const float beta_bias_for_step = fuse_beta_bias ? 0.0f : beta_bias_eff;
 
                             gemm_qkvb(d_x_q_,
@@ -2991,7 +3052,7 @@ public:
                                       wqkv_noise_nvfp4, wqkv_noise_sfb,
                                       d_scale_x_, H_, H_,
                                       q_out_scale_, k_out_scale_, v_out_scale_, beta_out_scale_,
-                                      beta_bias_eff, fuse_beta_bias,
+                                      beta_bias_eff, fuse_beta_bias, use_qkv_fused_layout,
                                       d_q_, d_k_, d_v_, d_beta_raw_);
                             if (D_ > 0) {
                                 float* d_K_l = d_K_f_ + static_cast<size_t>(l) * static_cast<size_t>(B_) * dh;
@@ -3007,7 +3068,8 @@ public:
                                 __half* d_S_h = use_fp16_state_
                                                     ? (d_S_h_ + static_cast<size_t>(l) * static_cast<size_t>(B_) * hh)
                                                     : nullptr;
-                                efla_full_state(d_S_f, d_S_h, beta_bias_for_step, d_y_);
+                                efla_full_state(d_S_f, d_S_h, beta_bias_for_step, d_y_,
+                                                d_qkv_f_, qkv_fused_cols_, use_qkv_fused_layout);
                             }
                             efla_lm_cuda::add_scaled(d_res_f_, d_y_, B_ * H_, residual_scale, stream_);
 
@@ -3111,9 +3173,13 @@ public:
                                                     : 0.0f;
                         const float beta_bias_eff =
                             bb_base + static_cast<float>(anti_sign) * noise_scale * bb_noise;
+                        const bool use_qkv_fused_layout =
+                            use_nvfp4 && use_fused_qkv_nvfp4_ && wqkv_nvfp4 && wqkv_sfb && d_qkv_f_ &&
+                            (D_ == 0) && !use_fused_efla_ && !use_efla_mixed_ &&
+                            !use_efla_fuse_diff_ && !use_efla_update_wmma_;
                         const bool fuse_beta_bias =
                             use_qkv_split_bias_ && use_nvfp4 && use_fused_qkv_nvfp4_ && use_qkv_split_kernel_ &&
-                            wqkv_nvfp4 && wqkv_sfb && d_qkv_f_;
+                            wqkv_nvfp4 && wqkv_sfb && d_qkv_f_ && !use_qkv_fused_layout;
                         const float beta_bias_for_step = fuse_beta_bias ? 0.0f : beta_bias_eff;
 
                         gemm_qkvb(x_in,
@@ -3129,7 +3195,7 @@ public:
                                   wqkv_noise_nvfp4, wqkv_noise_sfb,
                                   d_scale_x_, H_, H_,
                                   q_out_scale_, k_out_scale_, v_out_scale_, beta_out_scale_,
-                                  beta_bias_eff, fuse_beta_bias,
+                                  beta_bias_eff, fuse_beta_bias, use_qkv_fused_layout,
                                   d_q_, d_k_, d_v_, d_beta_raw_);
                         if (D_ > 0) {
                             float* d_K_l = d_K_f_ + static_cast<size_t>(l) * static_cast<size_t>(B_) * dh;
@@ -3145,7 +3211,8 @@ public:
                             __half* d_S_h = use_fp16_state_
                                                 ? (d_S_h_ + static_cast<size_t>(l) * static_cast<size_t>(B_) * hh)
                                                 : nullptr;
-                            efla_full_state(d_S_f, d_S_h, beta_bias_for_step, d_y_);
+                            efla_full_state(d_S_f, d_S_h, beta_bias_for_step, d_y_,
+                                            d_qkv_f_, qkv_fused_cols_, use_qkv_fused_layout);
                         }
                         if (int8_residual) {
                             if (use_nvfp4) {
@@ -4311,8 +4378,8 @@ int main(int argc, char** argv) {
         else if (a == "--qkv_split_vec4") cfg.qkv_split_vec4 = 1;
         else if (a == "--no_qkv_split_vec4") cfg.qkv_split_vec4 = 0;
         else if (a == "--qkv_split_vec4_auto") cfg.qkv_split_vec4 = -1;
-        else if (a == "--qkv_split_bias") cfg.use_qkv_split_bias = true;
-        else if (a == "--no_qkv_split_bias") cfg.use_qkv_split_bias = false;
+        else if (a == "--qkv_split_bias") { cfg.use_qkv_split_bias = true; }
+        else if (a == "--no_qkv_split_bias") { cfg.use_qkv_split_bias = false; }
         else if (a == "--fused_ff1") cfg.use_fused_ff1 = true;
         else if (a == "--no_fused_ff1") cfg.use_fused_ff1 = false;
         else if (a == "--fused_head_loss") cfg.use_fused_head_loss = true;
@@ -4699,6 +4766,7 @@ int main(int argc, char** argv) {
             }
             if (set_autotune) {
                 std::cerr << (first ? " " : ", ") << "autotune=off";
+                first = false;
             }
             std::cerr << ". Override with --nvfp4_*";
             if (set_graph) {

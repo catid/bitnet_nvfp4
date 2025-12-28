@@ -252,6 +252,31 @@ void activation_quantize_nvfp4(const float* d_in,
                                void* d_sfa,
                                cudaStream_t stream);
 
+// Embedding lookup (+ optional noise) fused with int8 + NVFP4 quantize (row-major).
+void embedding_lookup_noise_quantize_nvfp4(const uint8_t* d_tokens_t,
+                                           int token_stride,
+                                           const int8_t* d_emb_w,
+                                           const int8_t* d_emb_noise,
+                                           int hidden,
+                                           int batch,
+                                           float noise_scale,
+                                           int anti_sign,
+                                           int8_t* d_out_q,
+                                           void* d_out_nvfp4,
+                                           void* d_sfa,
+                                           cudaStream_t stream);
+
+// Add positional embeddings + GELU + quantize to int8 and NVFP4 (row-major).
+void add_pos_gelu_quantize_nvfp4(const float* d_in,
+                                 const float* d_pos_t,
+                                 int hidden,
+                                 int batch,
+                                 float act_scale,
+                                 int8_t* d_out_q,
+                                 void* d_out_nvfp4,
+                                 void* d_sfa,
+                                 cudaStream_t stream);
+
 // GELU + scale quantize to int8 and NVFP4 (row-major).
 void gelu_quantize_nvfp4(const float* d_in,
                          int rows,
