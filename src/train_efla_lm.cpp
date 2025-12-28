@@ -3745,10 +3745,12 @@ static void shape_pair_weights(std::vector<float>& w, const TrainConfig& cfg) {
     if (n <= 0) return;
 
     if (cfg.fitness_mode == TrainConfig::FitnessMode::CenteredRank) {
-        std::vector<int> order(n);
+        static thread_local std::vector<int> order;
+        static thread_local std::vector<float> ranked;
+        order.resize(n);
         for (int i = 0; i < n; ++i) order[i] = i;
         std::sort(order.begin(), order.end(), [&](int a, int b) { return w[a] < w[b]; });
-        std::vector<float> ranked(n, 0.0f);
+        ranked.resize(n);
         if (n == 1) {
             ranked[0] = 0.0f;
         } else {
@@ -4839,6 +4841,22 @@ int main(int argc, char** argv) {
             }
         }
 
+        std::vector<uint64_t> layer_salt_wq(static_cast<size_t>(cfg.layers));
+        std::vector<uint64_t> layer_salt_wk(static_cast<size_t>(cfg.layers));
+        std::vector<uint64_t> layer_salt_wv(static_cast<size_t>(cfg.layers));
+        std::vector<uint64_t> layer_salt_wbeta(static_cast<size_t>(cfg.layers));
+        std::vector<uint64_t> layer_salt_ff1(static_cast<size_t>(cfg.layers));
+        std::vector<uint64_t> layer_salt_ff2(static_cast<size_t>(cfg.layers));
+        for (int l = 0; l < cfg.layers; ++l) {
+            const uint64_t lu = static_cast<uint64_t>(l);
+            layer_salt_wq[static_cast<size_t>(l)] = rng::mix(lu, kSaltWq);
+            layer_salt_wk[static_cast<size_t>(l)] = rng::mix(lu, kSaltWk);
+            layer_salt_wv[static_cast<size_t>(l)] = rng::mix(lu, kSaltWv);
+            layer_salt_wbeta[static_cast<size_t>(l)] = rng::mix(lu, kSaltWbeta);
+            layer_salt_ff1[static_cast<size_t>(l)] = rng::mix(lu, kSaltFf1);
+            layer_salt_ff2[static_cast<size_t>(l)] = rng::mix(lu, kSaltFf2);
+        }
+
         std::vector<float> weights(static_cast<size_t>(pairs), 0.0f);
 
         float* h_pair_weights = nullptr;
@@ -5104,18 +5122,18 @@ int main(int argc, char** argv) {
                     const uint64_t seed_win = rng::mix(pair_seed, kSaltWin);
                     const uint64_t seed_head = rng::mix(pair_seed, kSaltHead);
                     for (int l = 0; l < cfg.layers; ++l) {
-                        const uint64_t lq = rng::mix(static_cast<uint64_t>(l), kSaltWq);
-                        const uint64_t lk = rng::mix(static_cast<uint64_t>(l), kSaltWk);
-                        const uint64_t lv = rng::mix(static_cast<uint64_t>(l), kSaltWv);
-                        const uint64_t lb = rng::mix(static_cast<uint64_t>(l), kSaltWbeta);
-                        const uint64_t lff1 = rng::mix(static_cast<uint64_t>(l), kSaltFf1);
-                        const uint64_t lff2 = rng::mix(static_cast<uint64_t>(l), kSaltFf2);
-                        seed_wq[static_cast<size_t>(l)] = rng::mix(pair_seed, lq);
-                        seed_wk[static_cast<size_t>(l)] = rng::mix(pair_seed, lk);
-                        seed_wv[static_cast<size_t>(l)] = rng::mix(pair_seed, lv);
-                        seed_wbeta[static_cast<size_t>(l)] = rng::mix(pair_seed, lb);
-                        seed_ff1[static_cast<size_t>(l)] = rng::mix(pair_seed, lff1);
-                        seed_ff2[static_cast<size_t>(l)] = rng::mix(pair_seed, lff2);
+                        seed_wq[static_cast<size_t>(l)] =
+                            rng::mix(pair_seed, layer_salt_wq[static_cast<size_t>(l)]);
+                        seed_wk[static_cast<size_t>(l)] =
+                            rng::mix(pair_seed, layer_salt_wk[static_cast<size_t>(l)]);
+                        seed_wv[static_cast<size_t>(l)] =
+                            rng::mix(pair_seed, layer_salt_wv[static_cast<size_t>(l)]);
+                        seed_wbeta[static_cast<size_t>(l)] =
+                            rng::mix(pair_seed, layer_salt_wbeta[static_cast<size_t>(l)]);
+                        seed_ff1[static_cast<size_t>(l)] =
+                            rng::mix(pair_seed, layer_salt_ff1[static_cast<size_t>(l)]);
+                        seed_ff2[static_cast<size_t>(l)] =
+                            rng::mix(pair_seed, layer_salt_ff2[static_cast<size_t>(l)]);
                     }
 
                     if (cfg.use_gpu_noise) {
@@ -5224,12 +5242,12 @@ int main(int argc, char** argv) {
                                       lr_t, thresh_t, worker.d_win_w(), hh_size, pairs,
                                       use_packed ? worker.d_win_packed() : nullptr);
                     for (int l = 0; l < cfg.layers; ++l) {
-                        const uint64_t lq = rng::mix(static_cast<uint64_t>(l), kSaltWq);
-                        const uint64_t lk = rng::mix(static_cast<uint64_t>(l), kSaltWk);
-                        const uint64_t lv = rng::mix(static_cast<uint64_t>(l), kSaltWv);
-                        const uint64_t lb = rng::mix(static_cast<uint64_t>(l), kSaltWbeta);
-                        const uint64_t lff1 = rng::mix(static_cast<uint64_t>(l), kSaltFf1);
-                        const uint64_t lff2 = rng::mix(static_cast<uint64_t>(l), kSaltFf2);
+                        const uint64_t lq = layer_salt_wq[static_cast<size_t>(l)];
+                        const uint64_t lk = layer_salt_wk[static_cast<size_t>(l)];
+                        const uint64_t lv = layer_salt_wv[static_cast<size_t>(l)];
+                        const uint64_t lb = layer_salt_wbeta[static_cast<size_t>(l)];
+                        const uint64_t lff1 = layer_salt_ff1[static_cast<size_t>(l)];
+                        const uint64_t lff2 = layer_salt_ff2[static_cast<size_t>(l)];
                         const size_t off_hh = static_cast<size_t>(l) * hh_size;
                         const size_t off_h = static_cast<size_t>(l) * h_size;
                         const size_t off_hf = static_cast<size_t>(l) * hf_size;
