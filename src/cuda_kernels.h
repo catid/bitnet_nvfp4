@@ -321,6 +321,7 @@ void nvfp4_set_schedule(Nvfp4Schedule schedule);
 void nvfp4_set_quant_mode(Nvfp4QuantMode mode);
 void nvfp4_set_stage_count(Nvfp4StageCount stages);
 void nvfp4_set_decomposition(Nvfp4Decomposition mode);
+void nvfp4_set_verbose(bool verbose);
 void nvfp4_set_splits(int splits);
 bool nvfp4_prepare_gemm(const void* d_a,
                         const void* d_b,

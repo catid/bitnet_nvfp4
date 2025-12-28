@@ -34,6 +34,7 @@ static bitnet_cuda::Nvfp4QuantMode g_nvfp4_quant_mode = bitnet_cuda::Nvfp4QuantM
 static bitnet_cuda::Nvfp4StageCount g_nvfp4_stage_count = bitnet_cuda::Nvfp4StageCount::Auto;
 static bitnet_cuda::Nvfp4Decomposition g_nvfp4_decomp = bitnet_cuda::Nvfp4Decomposition::Heuristic;
 static int g_nvfp4_splits = 1;
+static bool g_nvfp4_verbose = true;
 
 static inline bool nvfp4_use_streamk() {
     return g_nvfp4_splits > 1 ||
@@ -2772,8 +2773,10 @@ static bool nvfp4_prepare_entry(Nvfp4GemmCacheEntry<Gemm>* entry,
                                 cudaStream_t stream) {
     if (!entry) return false;
     if (Gemm::can_implement(args) != cutlass::Status::kSuccess) {
-        fprintf(stderr, "nvfp4_prepare_gemm: can_implement failed (m=%d n=%d k=%d)\n",
-                entry->m, entry->n, entry->k);
+        if (g_nvfp4_verbose) {
+            fprintf(stderr, "nvfp4_prepare_gemm: can_implement failed (m=%d n=%d k=%d)\n",
+                    entry->m, entry->n, entry->k);
+        }
         return false;
     }
     const size_t workspace_size = Gemm::get_workspace_size(args);
@@ -2785,15 +2788,19 @@ static bool nvfp4_prepare_entry(Nvfp4GemmCacheEntry<Gemm>* entry,
         }
         if (workspace_size > 0) {
             if (cudaMalloc(&entry->workspace, workspace_size) != cudaSuccess) {
-                fprintf(stderr, "nvfp4_prepare_gemm: cudaMalloc workspace failed (bytes=%zu)\n", workspace_size);
+                if (g_nvfp4_verbose) {
+                    fprintf(stderr, "nvfp4_prepare_gemm: cudaMalloc workspace failed (bytes=%zu)\n", workspace_size);
+                }
                 return false;
             }
             entry->workspace_size = workspace_size;
         }
     }
     if (entry->gemm.initialize(args, entry->workspace, stream) != cutlass::Status::kSuccess) {
-        fprintf(stderr, "nvfp4_prepare_gemm: initialize failed (m=%d n=%d k=%d)\n",
-                entry->m, entry->n, entry->k);
+        if (g_nvfp4_verbose) {
+            fprintf(stderr, "nvfp4_prepare_gemm: initialize failed (m=%d n=%d k=%d)\n",
+                    entry->m, entry->n, entry->k);
+        }
         return false;
     }
     entry->initialized = true;
@@ -3095,6 +3102,10 @@ void nvfp4_set_stage_count(Nvfp4StageCount stages) {
 
 void nvfp4_set_decomposition(Nvfp4Decomposition mode) {
     g_nvfp4_decomp = mode;
+}
+
+void nvfp4_set_verbose(bool verbose) {
+    g_nvfp4_verbose = verbose;
 }
 
 void nvfp4_set_splits(int splits) {

@@ -25,6 +25,7 @@
 #include <functional>
 #include <future>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <numbers>
 #include <memory>
@@ -263,6 +264,12 @@ struct TrainConfig {
     bitnet_cuda::Nvfp4StageCount nvfp4_stage_count = bitnet_cuda::Nvfp4StageCount::Auto;
     bitnet_cuda::Nvfp4Decomposition nvfp4_decomp = bitnet_cuda::Nvfp4Decomposition::Heuristic;
     int nvfp4_splits = 1;
+    bool nvfp4_autotune = true;
+    bool nvfp4_tune_schedule = true;
+    bool nvfp4_tune_quant = true;
+    bool nvfp4_tune_stages = true;
+    bool nvfp4_tune_decomp = true;
+    bool nvfp4_tune_splits = true;
 
     enum class Schedule { Constant = 0, Linear = 1, Cosine = 2, Exp = 3 };
     Schedule lr_schedule = Schedule::Cosine;
@@ -655,6 +662,12 @@ public:
                bitnet_cuda::Nvfp4StageCount nvfp4_stage_count,
                bitnet_cuda::Nvfp4Decomposition nvfp4_decomp,
                int nvfp4_splits,
+               bool nvfp4_autotune,
+               bool nvfp4_tune_schedule,
+               bool nvfp4_tune_quant,
+               bool nvfp4_tune_stages,
+               bool nvfp4_tune_decomp,
+               bool nvfp4_tune_splits,
                bool noise_batch,
                std::shared_ptr<DeviceWeights> weights)
         : device_(device),
@@ -682,12 +695,18 @@ public:
           use_tiled_gemm_(use_tiled_gemm),
           use_packed_gemm_(use_packed_gemm),
           use_packed_gemm_bitnet_(use_packed_gemm_bitnet),
-        gemm_backend_(gemm_backend),
-        nvfp4_schedule_(nvfp4_schedule),
-        nvfp4_quant_mode_(nvfp4_quant_mode),
-        nvfp4_stage_count_(nvfp4_stage_count),
-        nvfp4_decomp_(nvfp4_decomp),
-        nvfp4_splits_(nvfp4_splits),
+          gemm_backend_(gemm_backend),
+          nvfp4_schedule_(nvfp4_schedule),
+          nvfp4_quant_mode_(nvfp4_quant_mode),
+          nvfp4_stage_count_(nvfp4_stage_count),
+          nvfp4_decomp_(nvfp4_decomp),
+          nvfp4_splits_(nvfp4_splits),
+          nvfp4_autotune_(nvfp4_autotune),
+          nvfp4_tune_schedule_(nvfp4_tune_schedule),
+          nvfp4_tune_quant_(nvfp4_tune_quant),
+          nvfp4_tune_stages_(nvfp4_tune_stages),
+          nvfp4_tune_decomp_(nvfp4_tune_decomp),
+          nvfp4_tune_splits_(nvfp4_tune_splits),
           use_noise_batch_(noise_batch),
           weights_(std::move(weights)) {
         cuda_check(cudaSetDevice(device_), "cudaSetDevice");
@@ -1063,13 +1082,6 @@ public:
         if (h_loss_sum_pinned_) *h_loss_sum_pinned_ = 0.0f;
 
         cuda_check(cudaStreamSynchronize(stream_), "cudaStreamSynchronize init");
-
-        if (use_nvfp4_ && use_cuda_graph_) {
-            if (!prewarm_nvfp4_gemm_cache()) {
-                fprintf(stderr, "nvfp4 GEMM prewarm failed; disabling cuda_graph.\n");
-                use_cuda_graph_ = false;
-            }
-        }
     }
 
     ~CudaEflaLm() {
@@ -1279,6 +1291,58 @@ public:
         if (use_nvfp4_) {
             quantize_nvfp4_base_weights();
         }
+        const auto nvfp4_schedule_init = nvfp4_schedule_;
+        const auto nvfp4_quant_init = nvfp4_quant_mode_;
+        const auto nvfp4_stage_init = nvfp4_stage_count_;
+        const auto nvfp4_decomp_init = nvfp4_decomp_;
+        const int nvfp4_splits_init = nvfp4_splits_;
+        if (use_nvfp4_ && nvfp4_autotune_) {
+            maybe_autotune_nvfp4();
+        }
+
+        if (use_nvfp4_ && use_cuda_graph_) {
+            bitnet_cuda::nvfp4_set_verbose(false);
+            const bool prewarm_ok = prewarm_nvfp4_gemm_cache(false);
+            bitnet_cuda::nvfp4_set_verbose(true);
+            if (!prewarm_ok) {
+                bool restored = false;
+                if (nvfp4_autotune_ &&
+                    (nvfp4_schedule_ != nvfp4_schedule_init ||
+                     nvfp4_quant_mode_ != nvfp4_quant_init ||
+                     nvfp4_stage_count_ != nvfp4_stage_init ||
+                     nvfp4_decomp_ != nvfp4_decomp_init ||
+                     nvfp4_splits_ != nvfp4_splits_init)) {
+                    nvfp4_schedule_ = nvfp4_schedule_init;
+                    nvfp4_quant_mode_ = nvfp4_quant_init;
+                    nvfp4_stage_count_ = nvfp4_stage_init;
+                    nvfp4_decomp_ = nvfp4_decomp_init;
+                    nvfp4_splits_ = nvfp4_splits_init;
+                    bitnet_cuda::nvfp4_set_schedule(nvfp4_schedule_);
+                    bitnet_cuda::nvfp4_set_quant_mode(nvfp4_quant_mode_);
+                    bitnet_cuda::nvfp4_set_stage_count(nvfp4_stage_count_);
+                    bitnet_cuda::nvfp4_set_decomposition(nvfp4_decomp_);
+                    bitnet_cuda::nvfp4_set_splits(nvfp4_splits_);
+                    quantize_nvfp4_base_weights();
+                    refresh_nvfp4_activation_buffers();
+                    if (prewarm_nvfp4_gemm_cache()) {
+                        static bool warned_revert = false;
+                        if (!warned_revert) {
+                            fprintf(stderr, "nvfp4 autotune config failed prewarm; reverting to defaults for cuda_graph.\n");
+                            warned_revert = true;
+                        }
+                        restored = true;
+                    }
+                }
+                if (!restored) {
+                    static bool warned_graph = false;
+                    if (!warned_graph) {
+                        fprintf(stderr, "nvfp4 GEMM prewarm failed; disabling cuda_graph.\n");
+                        warned_graph = true;
+                    }
+                    use_cuda_graph_ = false;
+                }
+            }
+        }
 
     }
 
@@ -1389,6 +1453,353 @@ public:
                                           d_ff2_noise_nvfp4_[static_cast<size_t>(l)],
                                           d_ff2_noise_sfb_[static_cast<size_t>(l)], stream_);
         }
+    }
+
+    struct Nvfp4TuneResult {
+        bitnet_cuda::Nvfp4Schedule schedule = bitnet_cuda::Nvfp4Schedule::Auto;
+        bitnet_cuda::Nvfp4QuantMode quant = bitnet_cuda::Nvfp4QuantMode::Warp16;
+        bitnet_cuda::Nvfp4StageCount stages = bitnet_cuda::Nvfp4StageCount::Auto;
+        bitnet_cuda::Nvfp4Decomposition decomp = bitnet_cuda::Nvfp4Decomposition::Heuristic;
+        int splits = 1;
+        float ms = std::numeric_limits<float>::infinity();
+        bool valid = false;
+    };
+
+    struct Nvfp4TuneKey {
+        int batch = 0;
+        int hidden = 0;
+        int ffn_dim = 0;
+        int vocab = 0;
+        int layers = 0;
+        bool fused_qkv = false;
+    };
+
+    static bool nvfp4_tune_key_equal(const Nvfp4TuneKey& a, const Nvfp4TuneKey& b) {
+        return a.batch == b.batch &&
+               a.hidden == b.hidden &&
+               a.ffn_dim == b.ffn_dim &&
+               a.vocab == b.vocab &&
+               a.layers == b.layers &&
+               a.fused_qkv == b.fused_qkv;
+    }
+
+    void refresh_nvfp4_activation_buffers() {
+        if (!use_nvfp4_) return;
+        const size_t h_bytes = static_cast<size_t>(B_) * H_ * sizeof(float);
+        cuda_check(cudaMemsetAsync(d_emb_f_, 0, h_bytes, stream_), "cudaMemsetAsync emb_f");
+        bitnet_cuda::activation_quantize_nvfp4(d_emb_f_, B_, H_, H_, /*activation*/0,
+                                               d_emb_q_, d_a_nvfp4_h_, d_sfa_h_, stream_);
+        const size_t f_bytes = static_cast<size_t>(B_) * F_ * sizeof(float);
+        cuda_check(cudaMemsetAsync(d_ff1_f_, 0, f_bytes, stream_), "cudaMemsetAsync ff1_f");
+        bitnet_cuda::activation_quantize_nvfp4(d_ff1_f_, B_, F_, F_, /*activation*/0,
+                                               d_ff1_q_, d_a_nvfp4_f_, d_sfa_f_, stream_);
+        cuda_check(cudaStreamSynchronize(stream_), "cudaStreamSynchronize nvfp4 act");
+    }
+
+    void run_nvfp4_workload() {
+        if (!use_nvfp4_) return;
+        const float* d_c = nullptr;
+        d_c = d_inproj_f_;
+        bitnet_cuda::gemm_ternary_f_nvfp4(d_a_nvfp4_h_, d_win_nvfp4_,
+                                          d_sfa_h_, d_win_sfb_,
+                                          B_, H_, H_,
+                                          1.0f, 0.0f,
+                                          d_c, d_inproj_f_,
+                                          stream_);
+        for (int l = 0; l < L_; ++l) {
+            if (use_fused_qkv_nvfp4_ && !d_wqkv_nvfp4_.empty()) {
+                d_c = d_qkv_f_;
+                bitnet_cuda::gemm_ternary_f_nvfp4(d_a_nvfp4_h_, d_wqkv_nvfp4_[static_cast<size_t>(l)],
+                                                  d_sfa_h_, d_wqkv_sfb_[static_cast<size_t>(l)],
+                                                  B_, qkv_fused_cols_, H_,
+                                                  1.0f, 0.0f,
+                                                  d_c, d_qkv_f_,
+                                                  stream_);
+            } else {
+                d_c = d_q_;
+                bitnet_cuda::gemm_ternary_f_nvfp4(d_a_nvfp4_h_, d_wq_nvfp4_[static_cast<size_t>(l)],
+                                                  d_sfa_h_, d_wq_sfb_[static_cast<size_t>(l)],
+                                                  B_, H_, H_,
+                                                  1.0f, 0.0f,
+                                                  d_c, d_q_,
+                                                  stream_);
+                d_c = d_k_;
+                bitnet_cuda::gemm_ternary_f_nvfp4(d_a_nvfp4_h_, d_wk_nvfp4_[static_cast<size_t>(l)],
+                                                  d_sfa_h_, d_wk_sfb_[static_cast<size_t>(l)],
+                                                  B_, H_, H_,
+                                                  1.0f, 0.0f,
+                                                  d_c, d_k_,
+                                                  stream_);
+                d_c = d_v_;
+                bitnet_cuda::gemm_ternary_f_nvfp4(d_a_nvfp4_h_, d_wv_nvfp4_[static_cast<size_t>(l)],
+                                                  d_sfa_h_, d_wv_sfb_[static_cast<size_t>(l)],
+                                                  B_, H_, H_,
+                                                  1.0f, 0.0f,
+                                                  d_c, d_v_,
+                                                  stream_);
+                d_c = d_beta_raw_;
+                bitnet_cuda::gemm_ternary_f_nvfp4(d_a_nvfp4_h_, d_wbeta_nvfp4_[static_cast<size_t>(l)],
+                                                  d_sfa_h_, d_wbeta_sfb_[static_cast<size_t>(l)],
+                                                  B_, 1, H_,
+                                                  1.0f, 0.0f,
+                                                  d_c, d_beta_raw_,
+                                                  stream_);
+            }
+            d_c = d_ff1_f_;
+            bitnet_cuda::gemm_ternary_f_nvfp4(d_a_nvfp4_h_, d_ff1_nvfp4_[static_cast<size_t>(l)],
+                                              d_sfa_h_, d_ff1_sfb_[static_cast<size_t>(l)],
+                                              B_, F_, H_,
+                                              1.0f, 0.0f,
+                                              d_c, d_ff1_f_,
+                                              stream_);
+            d_c = d_y_;
+            bitnet_cuda::gemm_ternary_f_nvfp4(d_a_nvfp4_f_, d_ff2_nvfp4_[static_cast<size_t>(l)],
+                                              d_sfa_f_, d_ff2_sfb_[static_cast<size_t>(l)],
+                                              B_, H_, F_,
+                                              1.0f, 0.0f,
+                                              d_c, d_y_,
+                                              stream_);
+        }
+        d_c = d_logits_;
+        bitnet_cuda::gemm_ternary_f_nvfp4(d_a_nvfp4_h_, d_head_nvfp4_,
+                                          d_sfa_h_, d_head_sfb_,
+                                          B_, V_, H_,
+                                          1.0f, 0.0f,
+                                          d_c, d_logits_,
+                                          stream_);
+    }
+
+    float benchmark_nvfp4_workload(int warmup_iters, int iters) {
+        cudaEvent_t start = nullptr;
+        cudaEvent_t stop = nullptr;
+        cuda_check(cudaEventCreate(&start), "cudaEventCreate nvfp4 start");
+        cuda_check(cudaEventCreate(&stop), "cudaEventCreate nvfp4 stop");
+        for (int i = 0; i < warmup_iters; ++i) {
+            run_nvfp4_workload();
+        }
+        cuda_check(cudaEventRecord(start, stream_), "cudaEventRecord nvfp4 start");
+        for (int i = 0; i < iters; ++i) {
+            run_nvfp4_workload();
+        }
+        cuda_check(cudaEventRecord(stop, stream_), "cudaEventRecord nvfp4 stop");
+        cuda_check(cudaEventSynchronize(stop), "cudaEventSynchronize nvfp4 stop");
+        float ms = std::numeric_limits<float>::infinity();
+        cuda_check(cudaEventElapsedTime(&ms, start, stop), "cudaEventElapsedTime nvfp4");
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
+        if (cudaGetLastError() != cudaSuccess) {
+            return std::numeric_limits<float>::infinity();
+        }
+        return (iters > 0) ? (ms / static_cast<float>(iters)) : ms;
+    }
+
+    Nvfp4TuneResult autotune_nvfp4_impl() {
+        Nvfp4TuneResult best;
+        if (!use_nvfp4_) return best;
+        cuda_check(cudaSetDevice(device_), "cudaSetDevice nvfp4 autotune");
+        cuda_check(cudaStreamSynchronize(stream_), "cudaStreamSynchronize nvfp4 autotune");
+
+        std::vector<bitnet_cuda::Nvfp4Schedule> schedules;
+        if (nvfp4_tune_schedule_) {
+            schedules = {bitnet_cuda::Nvfp4Schedule::Auto,
+                         bitnet_cuda::Nvfp4Schedule::Cooperative,
+                         bitnet_cuda::Nvfp4Schedule::Pingpong};
+        } else {
+            schedules = {nvfp4_schedule_};
+        }
+        std::vector<bitnet_cuda::Nvfp4QuantMode> quants;
+        if (nvfp4_tune_quant_) {
+            quants = {bitnet_cuda::Nvfp4QuantMode::Warp16,
+                      bitnet_cuda::Nvfp4QuantMode::Warp4};
+        } else {
+            quants = {nvfp4_quant_mode_};
+        }
+        std::vector<bitnet_cuda::Nvfp4StageCount> stages;
+        if (nvfp4_tune_stages_) {
+            stages = {bitnet_cuda::Nvfp4StageCount::Auto,
+                      bitnet_cuda::Nvfp4StageCount::Stages2,
+                      bitnet_cuda::Nvfp4StageCount::Stages3,
+                      bitnet_cuda::Nvfp4StageCount::Stages4};
+        } else {
+            stages = {nvfp4_stage_count_};
+        }
+        std::vector<bitnet_cuda::Nvfp4Decomposition> decomps;
+        if (nvfp4_tune_decomp_) {
+            decomps = {bitnet_cuda::Nvfp4Decomposition::Heuristic,
+                       bitnet_cuda::Nvfp4Decomposition::DataParallel,
+                       bitnet_cuda::Nvfp4Decomposition::SplitK,
+                       bitnet_cuda::Nvfp4Decomposition::StreamK};
+        } else {
+            decomps = {nvfp4_decomp_};
+        }
+        std::vector<int> split_candidates;
+        if (nvfp4_tune_splits_) {
+            split_candidates = {1, 2, 4};
+        } else {
+            split_candidates = {std::max(1, nvfp4_splits_)};
+        }
+
+        int total = 0;
+        for (auto decomp : decomps) {
+            const bool use_splits = (decomp == bitnet_cuda::Nvfp4Decomposition::SplitK ||
+                                     decomp == bitnet_cuda::Nvfp4Decomposition::StreamK);
+            const int splits_count = use_splits ? static_cast<int>(split_candidates.size()) : 1;
+            total += static_cast<int>(schedules.size() * quants.size() * stages.size()) * splits_count;
+        }
+        fprintf(stderr, "nvfp4 autotune: testing %d configs\n", total);
+        bitnet_cuda::nvfp4_set_verbose(false);
+
+        bitnet_cuda::Nvfp4QuantMode current_quant = nvfp4_quant_mode_;
+        bitnet_cuda::nvfp4_set_quant_mode(current_quant);
+        refresh_nvfp4_activation_buffers();
+
+        const int warmup_iters = 2;
+        const int bench_iters = 5;
+
+        for (auto quant : quants) {
+            if (quant != current_quant) {
+                current_quant = quant;
+                nvfp4_quant_mode_ = quant;
+                bitnet_cuda::nvfp4_set_quant_mode(quant);
+                quantize_nvfp4_base_weights();
+                refresh_nvfp4_activation_buffers();
+            }
+            for (auto schedule : schedules) {
+                for (auto stage : stages) {
+                    for (auto decomp : decomps) {
+                        const bool use_splits = (decomp == bitnet_cuda::Nvfp4Decomposition::SplitK ||
+                                                 decomp == bitnet_cuda::Nvfp4Decomposition::StreamK);
+                        if (use_splits) {
+                            for (int splits : split_candidates) {
+                                nvfp4_schedule_ = schedule;
+                                nvfp4_stage_count_ = stage;
+                                nvfp4_decomp_ = decomp;
+                                nvfp4_splits_ = std::max(1, splits);
+                                bitnet_cuda::nvfp4_set_schedule(schedule);
+                                bitnet_cuda::nvfp4_set_stage_count(stage);
+                                bitnet_cuda::nvfp4_set_decomposition(decomp);
+                                bitnet_cuda::nvfp4_set_splits(nvfp4_splits_);
+
+                                if (!prewarm_nvfp4_gemm_cache(false)) {
+                                    continue;
+                                }
+                                const float ms = benchmark_nvfp4_workload(warmup_iters, bench_iters);
+                                if (ms < best.ms) {
+                                    best.ms = ms;
+                                    best.schedule = schedule;
+                                    best.quant = quant;
+                                    best.stages = stage;
+                                    best.decomp = decomp;
+                                    best.splits = nvfp4_splits_;
+                                    best.valid = true;
+                                }
+                            }
+                        } else {
+                            nvfp4_schedule_ = schedule;
+                            nvfp4_stage_count_ = stage;
+                            nvfp4_decomp_ = decomp;
+                            nvfp4_splits_ = 1;
+                            bitnet_cuda::nvfp4_set_schedule(schedule);
+                            bitnet_cuda::nvfp4_set_stage_count(stage);
+                            bitnet_cuda::nvfp4_set_decomposition(decomp);
+                            bitnet_cuda::nvfp4_set_splits(nvfp4_splits_);
+
+                            if (!prewarm_nvfp4_gemm_cache(false)) {
+                                continue;
+                            }
+                            const float ms = benchmark_nvfp4_workload(warmup_iters, bench_iters);
+                            if (ms < best.ms) {
+                                best.ms = ms;
+                                best.schedule = schedule;
+                                best.quant = quant;
+                                best.stages = stage;
+                                best.decomp = decomp;
+                                best.splits = nvfp4_splits_;
+                                best.valid = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!best.valid) {
+            bitnet_cuda::nvfp4_set_verbose(true);
+            fprintf(stderr, "nvfp4 autotune: no valid configs found; keeping defaults\n");
+            return best;
+        }
+
+        if (best.quant != current_quant) {
+            current_quant = best.quant;
+            nvfp4_quant_mode_ = best.quant;
+            bitnet_cuda::nvfp4_set_quant_mode(best.quant);
+            quantize_nvfp4_base_weights();
+            refresh_nvfp4_activation_buffers();
+        }
+        nvfp4_schedule_ = best.schedule;
+        nvfp4_stage_count_ = best.stages;
+        nvfp4_decomp_ = best.decomp;
+        nvfp4_splits_ = std::max(1, best.splits);
+        bitnet_cuda::nvfp4_set_schedule(best.schedule);
+        bitnet_cuda::nvfp4_set_stage_count(best.stages);
+        bitnet_cuda::nvfp4_set_decomposition(best.decomp);
+        bitnet_cuda::nvfp4_set_splits(nvfp4_splits_);
+
+        const char* sched_name = (best.schedule == bitnet_cuda::Nvfp4Schedule::Cooperative) ? "cooperative" :
+                                 (best.schedule == bitnet_cuda::Nvfp4Schedule::Pingpong) ? "pingpong" : "auto";
+        const char* quant_name = (best.quant == bitnet_cuda::Nvfp4QuantMode::Warp4) ? "warp4" : "warp16";
+        const char* stage_name = "auto";
+        switch (best.stages) {
+            case bitnet_cuda::Nvfp4StageCount::Stages2: stage_name = "2"; break;
+            case bitnet_cuda::Nvfp4StageCount::Stages3: stage_name = "3"; break;
+            case bitnet_cuda::Nvfp4StageCount::Stages4: stage_name = "4"; break;
+            case bitnet_cuda::Nvfp4StageCount::Auto: default: stage_name = "auto"; break;
+        }
+        const char* decomp_name = "auto";
+        switch (best.decomp) {
+            case bitnet_cuda::Nvfp4Decomposition::DataParallel: decomp_name = "data"; break;
+            case bitnet_cuda::Nvfp4Decomposition::SplitK: decomp_name = "splitk"; break;
+            case bitnet_cuda::Nvfp4Decomposition::StreamK: decomp_name = "streamk"; break;
+            case bitnet_cuda::Nvfp4Decomposition::Heuristic: default: decomp_name = "auto"; break;
+        }
+        fprintf(stderr, "nvfp4 autotune: best schedule=%s quant=%s stages=%s decomp=%s splits=%d (%.3f ms)\n",
+                sched_name, quant_name, stage_name, decomp_name, nvfp4_splits_, best.ms);
+        bitnet_cuda::nvfp4_set_verbose(true);
+        return best;
+    }
+
+    void maybe_autotune_nvfp4() {
+        if (!use_nvfp4_ || !nvfp4_autotune_) return;
+        static std::mutex tune_mutex;
+        static std::vector<std::pair<Nvfp4TuneKey, Nvfp4TuneResult>> tune_cache;
+        Nvfp4TuneKey key{B_, H_, F_, V_, L_, use_fused_qkv_nvfp4_};
+        std::lock_guard<std::mutex> lock(tune_mutex);
+        for (const auto& entry : tune_cache) {
+            if (nvfp4_tune_key_equal(entry.first, key)) {
+                const Nvfp4TuneResult& cached = entry.second;
+                if (cached.valid) {
+                    const bool quant_changed = (nvfp4_quant_mode_ != cached.quant);
+                    nvfp4_schedule_ = cached.schedule;
+                    nvfp4_quant_mode_ = cached.quant;
+                    nvfp4_stage_count_ = cached.stages;
+                    nvfp4_decomp_ = cached.decomp;
+                    nvfp4_splits_ = std::max(1, cached.splits);
+                    bitnet_cuda::nvfp4_set_schedule(nvfp4_schedule_);
+                    bitnet_cuda::nvfp4_set_quant_mode(nvfp4_quant_mode_);
+                    bitnet_cuda::nvfp4_set_stage_count(nvfp4_stage_count_);
+                    bitnet_cuda::nvfp4_set_decomposition(nvfp4_decomp_);
+                    bitnet_cuda::nvfp4_set_splits(nvfp4_splits_);
+                    if (quant_changed) {
+                        quantize_nvfp4_base_weights();
+                    }
+                    refresh_nvfp4_activation_buffers();
+                    return;
+                }
+            }
+        }
+
+        Nvfp4TuneResult best = autotune_nvfp4_impl();
+        tune_cache.emplace_back(key, best);
     }
 
     void set_noise_weights(const EflaLmWeights& n) {
@@ -3012,14 +3423,22 @@ private:
     bitnet_cuda::Nvfp4StageCount nvfp4_stage_count_ = bitnet_cuda::Nvfp4StageCount::Auto;
     bitnet_cuda::Nvfp4Decomposition nvfp4_decomp_ = bitnet_cuda::Nvfp4Decomposition::Heuristic;
     int nvfp4_splits_ = 1;
+    bool nvfp4_autotune_ = false;
+    bool nvfp4_tune_schedule_ = false;
+    bool nvfp4_tune_quant_ = false;
+    bool nvfp4_tune_stages_ = false;
+    bool nvfp4_tune_decomp_ = false;
+    bool nvfp4_tune_splits_ = false;
     bool use_noise_batch_ = true;
 
-    bool prewarm_nvfp4_gemm_cache() {
+    bool prewarm_nvfp4_gemm_cache(bool verbose = true) {
         if (!use_nvfp4_) return false;
         if (!d_a_nvfp4_h_ || !d_sfa_h_) return false;
         auto prep_h = [&](int rows, const void* d_b, const void* d_sfb, const float* d_c, float* d_d, const char* tag) -> bool {
             if (!d_b || !d_sfb) {
-                fprintf(stderr, "nvfp4 prewarm skip %s (missing weights)\n", tag);
+                if (verbose) {
+                    fprintf(stderr, "nvfp4 prewarm skip %s (missing weights)\n", tag);
+                }
                 return true;
             }
             if (!bitnet_cuda::nvfp4_prepare_gemm(d_a_nvfp4_h_, d_b, d_sfa_h_, d_sfb,
@@ -3027,18 +3446,24 @@ private:
                                                  1.0f, 0.0f,
                                                  d_c, d_d,
                                                  stream_)) {
-                fprintf(stderr, "nvfp4 prewarm failed for %s (m=%d n=%d k=%d)\n", tag, B_, rows, H_);
+                if (verbose) {
+                    fprintf(stderr, "nvfp4 prewarm failed for %s (m=%d n=%d k=%d)\n", tag, B_, rows, H_);
+                }
                 return false;
             }
             return true;
         };
         auto prep_f = [&](int rows, const void* d_b, const void* d_sfb, const float* d_c, float* d_d, const char* tag) -> bool {
             if (!d_a_nvfp4_f_ || !d_sfa_f_) {
-                fprintf(stderr, "nvfp4 prewarm skip %s (missing activation buffers)\n", tag);
+                if (verbose) {
+                    fprintf(stderr, "nvfp4 prewarm skip %s (missing activation buffers)\n", tag);
+                }
                 return true;
             }
             if (!d_b || !d_sfb) {
-                fprintf(stderr, "nvfp4 prewarm skip %s (missing weights)\n", tag);
+                if (verbose) {
+                    fprintf(stderr, "nvfp4 prewarm skip %s (missing weights)\n", tag);
+                }
                 return true;
             }
             if (!bitnet_cuda::nvfp4_prepare_gemm(d_a_nvfp4_f_, d_b, d_sfa_f_, d_sfb,
@@ -3046,7 +3471,9 @@ private:
                                                  1.0f, 0.0f,
                                                  d_c, d_d,
                                                  stream_)) {
-                fprintf(stderr, "nvfp4 prewarm failed for %s (m=%d n=%d k=%d)\n", tag, B_, rows, F_);
+                if (verbose) {
+                    fprintf(stderr, "nvfp4 prewarm failed for %s (m=%d n=%d k=%d)\n", tag, B_, rows, F_);
+                }
                 return false;
             }
             return true;
@@ -3698,6 +4125,11 @@ int main(int argc, char** argv) {
     bool sigma_specified = false;
     bool act_scale_specified = false;
     bool mlp_act_scale_specified = false;
+    bool nvfp4_schedule_specified = false;
+    bool nvfp4_quant_specified = false;
+    bool nvfp4_stage_specified = false;
+    bool nvfp4_decomp_specified = false;
+    bool nvfp4_splits_specified = false;
     bool lr_schedule_specified = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -3767,11 +4199,13 @@ int main(int argc, char** argv) {
         else if (a == "--gemm_backend") cfg.gemm_backend = parse_gemm_backend(next(i));
         else if (a == "--cutlass_gemm") cfg.gemm_backend = TrainConfig::GemmBackend::Cutlass;
         else if (a == "--cutlass_nvfp4") cfg.gemm_backend = TrainConfig::GemmBackend::CutlassNvfp4;
-        else if (a == "--nvfp4_schedule") cfg.nvfp4_schedule = parse_nvfp4_schedule(next(i));
-        else if (a == "--nvfp4_quant") cfg.nvfp4_quant_mode = parse_nvfp4_quant_mode(next(i));
-        else if (a == "--nvfp4_stages") cfg.nvfp4_stage_count = parse_nvfp4_stage_count(next(i));
-        else if (a == "--nvfp4_decomp") cfg.nvfp4_decomp = parse_nvfp4_decomp(next(i));
-        else if (a == "--nvfp4_splits") cfg.nvfp4_splits = std::max(1, std::stoi(next(i)));
+        else if (a == "--nvfp4_schedule") { cfg.nvfp4_schedule = parse_nvfp4_schedule(next(i)); nvfp4_schedule_specified = true; }
+        else if (a == "--nvfp4_quant") { cfg.nvfp4_quant_mode = parse_nvfp4_quant_mode(next(i)); nvfp4_quant_specified = true; }
+        else if (a == "--nvfp4_stages") { cfg.nvfp4_stage_count = parse_nvfp4_stage_count(next(i)); nvfp4_stage_specified = true; }
+        else if (a == "--nvfp4_decomp") { cfg.nvfp4_decomp = parse_nvfp4_decomp(next(i)); nvfp4_decomp_specified = true; }
+        else if (a == "--nvfp4_splits") { cfg.nvfp4_splits = std::max(1, std::stoi(next(i))); nvfp4_splits_specified = true; }
+        else if (a == "--nvfp4_autotune") cfg.nvfp4_autotune = true;
+        else if (a == "--no_nvfp4_autotune") cfg.nvfp4_autotune = false;
         else if (a == "--efla_fused") cfg.use_fused_efla = true;
         else if (a == "--no_efla_fused") cfg.use_fused_efla = false;
         else if (a == "--efla_mixed") cfg.use_efla_mixed = true;
@@ -3911,6 +4345,8 @@ int main(int argc, char** argv) {
                 "  --nvfp4_stages {auto|2|3|4} (default auto)\n"
                 "  --nvfp4_decomp {auto|data|splitk|streamk} (default auto)\n"
                 "  --nvfp4_splits N  split-K factor for nvfp4 (default 1)\n"
+                "  --nvfp4_autotune enable nvfp4 tuning for unset options (default on)\n"
+                "  --no_nvfp4_autotune disable nvfp4 tuning\n"
                 "  --efla_fused      use single-kernel EFLA step (default on)\n"
                 "  --no_efla_fused   disable fused EFLA step\n"
                 "  --efla_mixed      store k_usage/diff in FP16 during EFLA step (default off)\n"
@@ -4089,6 +4525,22 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (cfg.data_seed == 0) cfg.data_seed = cfg.seed;
+    if (cfg.gemm_backend != TrainConfig::GemmBackend::CutlassNvfp4) {
+        cfg.nvfp4_autotune = false;
+    }
+    if (cfg.nvfp4_autotune) {
+        cfg.nvfp4_tune_schedule = !nvfp4_schedule_specified;
+        cfg.nvfp4_tune_quant = !nvfp4_quant_specified;
+        cfg.nvfp4_tune_stages = !nvfp4_stage_specified;
+        cfg.nvfp4_tune_decomp = !nvfp4_decomp_specified;
+        cfg.nvfp4_tune_splits = !nvfp4_splits_specified;
+    } else {
+        cfg.nvfp4_tune_schedule = false;
+        cfg.nvfp4_tune_quant = false;
+        cfg.nvfp4_tune_stages = false;
+        cfg.nvfp4_tune_decomp = false;
+        cfg.nvfp4_tune_splits = false;
+    }
 
     configure_openmp(cfg.omp_threads);
 
@@ -4215,6 +4667,12 @@ int main(int argc, char** argv) {
                                                                  cfg.nvfp4_stage_count,
                                                                  cfg.nvfp4_decomp,
                                                                  cfg.nvfp4_splits,
+                                                                 cfg.nvfp4_autotune,
+                                                                 cfg.nvfp4_tune_schedule,
+                                                                 cfg.nvfp4_tune_quant,
+                                                                 cfg.nvfp4_tune_stages,
+                                                                 cfg.nvfp4_tune_decomp,
+                                                                 cfg.nvfp4_tune_splits,
                                                                  cfg.noise_batch,
                                                                  device_weights[di]));
                 device_model_indices[di].push_back(models.size() - 1);
