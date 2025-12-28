@@ -3548,11 +3548,12 @@ static void gpu_update_alloc_shadow(CudaEflaLm& model, GpuMatrixState& st, size_
 
 static void gpu_update_upload_pair_weights(CudaEflaLm& model,
                                            GpuUpdateBuffers& buf,
-                                           const std::vector<float>& pair_weights) {
-    if (pair_weights.empty()) return;
-    gpu_update_ensure_buffers(model, buf, buf.z_capacity, static_cast<int>(pair_weights.size()));
-    cuda_check(cudaMemcpyAsync(buf.d_pair_weights, pair_weights.data(),
-                               pair_weights.size() * sizeof(float),
+                                           const float* pair_weights,
+                                           int pair_count) {
+    if (!pair_weights || pair_count <= 0) return;
+    gpu_update_ensure_buffers(model, buf, buf.z_capacity, pair_count);
+    cuda_check(cudaMemcpyAsync(buf.d_pair_weights, pair_weights,
+                               static_cast<size_t>(pair_count) * sizeof(float),
                                cudaMemcpyHostToDevice, model.stream()),
                "cudaMemcpyAsync pair_weights");
 }
@@ -4179,6 +4180,14 @@ int main(int argc, char** argv) {
         const int pairs = cfg.population / 2;
         const int method_id = static_cast<int>(cfg.method);
 
+        float* h_pair_weights = nullptr;
+        if (cfg.use_gpu_update && pairs > 0) {
+            cuda_check(cudaHostAlloc(reinterpret_cast<void**>(&h_pair_weights),
+                                     static_cast<size_t>(pairs) * sizeof(float),
+                                     cudaHostAllocDefault),
+                       "cudaHostAlloc pair_weights");
+        }
+
         MatrixOptState st_emb, st_win, st_head;
         std::vector<MatrixOptState> st_wq(static_cast<size_t>(cfg.layers));
         std::vector<MatrixOptState> st_wk(static_cast<size_t>(cfg.layers));
@@ -4464,6 +4473,9 @@ int main(int argc, char** argv) {
 
             std::vector<float> weights = raw;
             shape_pair_weights(weights, cfg);
+            if (h_pair_weights) {
+                std::copy(weights.begin(), weights.end(), h_pair_weights);
+            }
 
             const auto update_t0 = Clock::now();
             if (cfg.use_gpu_update) {
@@ -4477,7 +4489,7 @@ int main(int argc, char** argv) {
                     GpuUpdateDevice& gu = gpu_updates[dev_idx];
                     const bool use_packed = worker.use_packed_gemm();
 
-                    gpu_update_upload_pair_weights(worker, gu.buf, weights);
+                    gpu_update_upload_pair_weights(worker, gu.buf, h_pair_weights ? h_pair_weights : weights.data(), pairs);
                     gpu_update_fill_pair_seeds(worker, gu.buf, cfg.seed,
                                                static_cast<uint64_t>(epoch), pairs);
 
@@ -4724,6 +4736,9 @@ int main(int argc, char** argv) {
                     gpu_update_free_matrix(dev, gu.ff2[l]);
                 }
             }
+        }
+        if (h_pair_weights) {
+            cudaFreeHost(h_pair_weights);
         }
         for (size_t di = 0; di < update_done_events.size(); ++di) {
             if (!update_done_events[di]) continue;
