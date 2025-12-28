@@ -1104,6 +1104,76 @@ __global__ void efla_kS_kernel_half2_kh(const __half* __restrict__ S,
         atomicAdd(&kS[b * hidden + n + 1], acc1);
     }
 }
+
+__global__ void efla_kS_kernel_half2_ksh(const __half* __restrict__ S,
+                                         const float* __restrict__ k_usage,
+                                         int hidden,
+                                         int tile_d,
+                                         float* __restrict__ kS) {
+    __shared__ float k_sh[128];
+    const int b = blockIdx.x;
+    const int tile_n = blockDim.x * 2;
+    const int n = blockIdx.y * tile_n + threadIdx.x * 2;
+    const int d0 = blockIdx.z * tile_d;
+    int d1 = d0 + tile_d;
+    if (d1 > hidden) d1 = hidden;
+    const int count = d1 - d0;
+    const float* kb = k_usage + b * hidden + d0;
+    for (int d = threadIdx.x; d < count; d += blockDim.x) {
+        k_sh[d] = kb[d];
+    }
+    __syncthreads();
+    if (n >= hidden) return;
+    const __half* Sb = S + static_cast<size_t>(b) * hidden * hidden;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    for (int d = 0; d < count; ++d) {
+        const __half2 s2 = reinterpret_cast<const __half2*>(Sb + (d0 + d) * hidden + n)[0];
+        const float2 sf = __half22float2(s2);
+        const float k = k_sh[d];
+        acc0 += k * sf.x;
+        acc1 += k * sf.y;
+    }
+    atomicAdd(&kS[b * hidden + n], acc0);
+    if (n + 1 < hidden) {
+        atomicAdd(&kS[b * hidden + n + 1], acc1);
+    }
+}
+
+__global__ void efla_kS_kernel_half2_kh_ksh(const __half* __restrict__ S,
+                                            const __half* __restrict__ k_usage,
+                                            int hidden,
+                                            int tile_d,
+                                            float* __restrict__ kS) {
+    __shared__ float k_sh[128];
+    const int b = blockIdx.x;
+    const int tile_n = blockDim.x * 2;
+    const int n = blockIdx.y * tile_n + threadIdx.x * 2;
+    const int d0 = blockIdx.z * tile_d;
+    int d1 = d0 + tile_d;
+    if (d1 > hidden) d1 = hidden;
+    const int count = d1 - d0;
+    const __half* kb = k_usage + b * hidden + d0;
+    for (int d = threadIdx.x; d < count; d += blockDim.x) {
+        k_sh[d] = __half2float(kb[d]);
+    }
+    __syncthreads();
+    if (n >= hidden) return;
+    const __half* Sb = S + static_cast<size_t>(b) * hidden * hidden;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    for (int d = 0; d < count; ++d) {
+        const __half2 s2 = reinterpret_cast<const __half2*>(Sb + (d0 + d) * hidden + n)[0];
+        const float2 sf = __half22float2(s2);
+        const float k = k_sh[d];
+        acc0 += k * sf.x;
+        acc1 += k * sf.y;
+    }
+    atomicAdd(&kS[b * hidden + n], acc0);
+    if (n + 1 < hidden) {
+        atomicAdd(&kS[b * hidden + n + 1], acc1);
+    }
+}
 __global__ void efla_diff_kernel(const float* __restrict__ v,
                                  const float* __restrict__ kS,
                                  int n,
@@ -2206,9 +2276,17 @@ void efla_step_half(__half* d_S,
         if ((hidden & 1) == 0) {
             dim3 block_k(tile_n / 2, 1, 1);
             if (use_mixed) {
-                efla_kS_kernel_half2_kh<<<grid_k, block_k, 0, stream>>>(d_S, d_k_usage_h, hidden, tile_d, d_kS);
+                if (tile_d == 128) {
+                    efla_kS_kernel_half2_kh_ksh<<<grid_k, block_k, 0, stream>>>(d_S, d_k_usage_h, hidden, tile_d, d_kS);
+                } else {
+                    efla_kS_kernel_half2_kh<<<grid_k, block_k, 0, stream>>>(d_S, d_k_usage_h, hidden, tile_d, d_kS);
+                }
             } else {
-                efla_kS_kernel_half2<<<grid_k, block_k, 0, stream>>>(d_S, d_k_usage, hidden, tile_d, d_kS);
+                if (tile_d == 128) {
+                    efla_kS_kernel_half2_ksh<<<grid_k, block_k, 0, stream>>>(d_S, d_k_usage, hidden, tile_d, d_kS);
+                } else {
+                    efla_kS_kernel_half2<<<grid_k, block_k, 0, stream>>>(d_S, d_k_usage, hidden, tile_d, d_kS);
+                }
             }
         } else {
             dim3 block_k(tile_n, 1, 1);
@@ -2324,7 +2402,11 @@ void efla_step_half_qkv_fused(__half* d_S,
         dim3 grid_k(batch, (hidden + tile_n - 1) / tile_n, (hidden + tile_d - 1) / tile_d);
         if ((hidden & 1) == 0) {
             dim3 block_k(tile_n / 2, 1, 1);
-            efla_kS_kernel_half2<<<grid_k, block_k, 0, stream>>>(d_S, d_k_usage, hidden, tile_d, d_kS);
+            if (tile_d == 128) {
+                efla_kS_kernel_half2_ksh<<<grid_k, block_k, 0, stream>>>(d_S, d_k_usage, hidden, tile_d, d_kS);
+            } else {
+                efla_kS_kernel_half2<<<grid_k, block_k, 0, stream>>>(d_S, d_k_usage, hidden, tile_d, d_kS);
+            }
         } else {
             dim3 block_k(tile_n, 1, 1);
             efla_kS_kernel_half<<<grid_k, block_k, 0, stream>>>(d_S, d_k_usage, hidden, tile_d, d_kS);
