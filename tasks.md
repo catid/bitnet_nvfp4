@@ -36,6 +36,7 @@
   - [x] Experiment: two-pass partial reduction (write per z-block then reduce; regressed avg tok/s_total ~928k vs ~967k baseline; reverted).
   - [x] Experiment: use batched GEMV/GEMM (cuBLAS) for kS/out (avg tok/s_total ~875k vs ~967k baseline; regressed; reverted).
   - [x] Experiment: force full-D kS/out for hidden=512 with tile_n=256 (grid_z=1; avg tok/s_total ~886k vs ~966k baseline; regressed; reverted).
+  - [x] Experiment: cache k_usage tile in shared for half2 kS when tile_d=128 (avg tok/s_total ~988k vs ~967k baseline; kept).
 - [ ] EFLA update kernel (~16.8%): improve arithmetic intensity and caching.
   - [x] Experiment: load k_usage/diff into shared per block; reuse for multiple S rows (regressed avg tok/s_total ~848k; reverted).
   - [x] Experiment: fuse diff + update for H=512 (default kernel, --efla_fuse_diff) (avg tok/s_total ~920k vs ~925k baseline; left off).
@@ -48,6 +49,7 @@
   - [ ] Experiment: batched GEMV/GEMM alternative.
 - [ ] EFLA prepare + diff (~8.6% total): reduce kernel count.
   - [ ] Experiment: fuse prepare with kS (compute q_norm/k_usage on the fly).
+  - [ ] Experiment: warp-reduction kS for H=512 (tile_d=32), using warp shuffles to sum across z-tiles and write once per n (removes atomics for half2 path).
   - [ ] Experiment: fuse diff into update (H=512 tuned).
 - [ ] NVFP4 absmean_norm_q_nvfp4 (~11.1%) + add_scaled_to_int8_absmean_norm_q_nvfp4 (~10.9%).
   - [ ] Experiment: ensure all residual paths use the fused add+norm kernel (eliminate standalone absmean_norm where possible).
