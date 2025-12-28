@@ -1631,6 +1631,15 @@ __global__ void efla_out_kernel_half2_full(const __half* __restrict__ S,
     }
 }
 
+__global__ void efla_zero_kS_out_kernel(float* __restrict__ kS,
+                                        float* __restrict__ out,
+                                        int n) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    kS[idx] = 0.0f;
+    out[idx] = 0.0f;
+}
+
 } // namespace
 
 namespace efla_lm_cuda {
@@ -2178,6 +2187,12 @@ void efla_step_half(__half* d_S,
     int tile_d = 32;
     select_efla_tiles(hidden, &tile_n, &tile_d);
     const bool use_full = ((hidden & 1) == 0) && (hidden <= 256);
+    if (!use_full) {
+        const int n_total = batch * hidden;
+        const int zero_threads = 256;
+        const int zero_blocks = (n_total + zero_threads - 1) / zero_threads;
+        efla_zero_kS_out_kernel<<<zero_blocks, zero_threads, 0, stream>>>(d_kS, d_out, n_total);
+    }
     if (use_full) {
         dim3 block_k(tile_n / 2, 1, 1);
         dim3 grid_k(batch, (hidden + tile_n - 1) / tile_n, 1);
@@ -2187,7 +2202,6 @@ void efla_step_half(__half* d_S,
             efla_kS_kernel_half2_full<<<grid_k, block_k, 0, stream>>>(d_S, d_k_usage, hidden, d_kS);
         }
     } else {
-        cudaMemsetAsync(d_kS, 0, static_cast<size_t>(batch) * hidden * sizeof(float), stream);
         dim3 grid_k(batch, (hidden + tile_n - 1) / tile_n, (hidden + tile_d - 1) / tile_d);
         if ((hidden & 1) == 0) {
             dim3 block_k(tile_n / 2, 1, 1);
@@ -2261,7 +2275,6 @@ void efla_step_half(__half* d_S,
         dim3 grid_k(batch, (hidden + tile_n - 1) / tile_n, 1);
         efla_out_kernel_half2_full<<<grid_k, block_k, 0, stream>>>(d_S, d_q_norm, hidden, d_out);
     } else {
-        cudaMemsetAsync(d_out, 0, static_cast<size_t>(batch) * hidden * sizeof(float), stream);
         dim3 grid_k(batch, (hidden + tile_n - 1) / tile_n, (hidden + tile_d - 1) / tile_d);
         if ((hidden & 1) == 0) {
             dim3 block_k(tile_n / 2, 1, 1);
@@ -2297,12 +2310,17 @@ void efla_step_half_qkv_fused(__half* d_S,
     int tile_d = 32;
     select_efla_tiles(hidden, &tile_n, &tile_d);
     const bool use_full = ((hidden & 1) == 0) && (hidden <= 256);
+    if (!use_full) {
+        const int n_total = batch * hidden;
+        const int zero_threads = 256;
+        const int zero_blocks = (n_total + zero_threads - 1) / zero_threads;
+        efla_zero_kS_out_kernel<<<zero_blocks, zero_threads, 0, stream>>>(d_kS, d_out, n_total);
+    }
     if (use_full) {
         dim3 block_k(tile_n / 2, 1, 1);
         dim3 grid_k(batch, (hidden + tile_n - 1) / tile_n, 1);
         efla_kS_kernel_half2_full<<<grid_k, block_k, 0, stream>>>(d_S, d_k_usage, hidden, d_kS);
     } else {
-        cudaMemsetAsync(d_kS, 0, static_cast<size_t>(batch) * hidden * sizeof(float), stream);
         dim3 grid_k(batch, (hidden + tile_n - 1) / tile_n, (hidden + tile_d - 1) / tile_d);
         if ((hidden & 1) == 0) {
             dim3 block_k(tile_n / 2, 1, 1);
@@ -2335,7 +2353,6 @@ void efla_step_half_qkv_fused(__half* d_S,
         dim3 grid_k(batch, (hidden + tile_n - 1) / tile_n, 1);
         efla_out_kernel_half2_full<<<grid_k, block_k, 0, stream>>>(d_S, d_q_norm, hidden, d_out);
     } else {
-        cudaMemsetAsync(d_out, 0, static_cast<size_t>(batch) * hidden * sizeof(float), stream);
         dim3 grid_k(batch, (hidden + tile_n - 1) / tile_n, (hidden + tile_d - 1) / tile_d);
         if ((hidden & 1) == 0) {
             dim3 block_k(tile_n / 2, 1, 1);
