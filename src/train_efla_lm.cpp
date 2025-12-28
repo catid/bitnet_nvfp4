@@ -2692,6 +2692,32 @@ public:
                                                          stream_);
                     return;
                 }
+                if (use_nvfp4 && !use_packed_gemm_ && noise_active &&
+                    d_w_nvfp4 && d_w_sfb &&
+                    d_w_noise_nvfp4 && d_w_noise_sfb) {
+                    auto act = get_nvfp4_act(d_x, cols);
+                    if (act.first && act.second) {
+                        const float* d_c = d_out_f;
+                        bitnet_cuda::gemm_ternary_f_nvfp4(act.first, d_w_nvfp4,
+                                                          act.second, d_w_sfb,
+                                                          B_, rows, cols,
+                                                          out_scale, 0.0f,
+                                                          d_c, d_out_f,
+                                                          stream_);
+                        const float alpha = out_scale * static_cast<float>(anti_sign) * noise_scale;
+                        bitnet_cuda::gemm_ternary_f_nvfp4_gelu_i8(act.first, d_w_noise_nvfp4,
+                                                                  act.second, d_w_noise_sfb,
+                                                                  B_, rows, cols,
+                                                                  alpha, 1.0f,
+                                                                  d_out_f,
+                                                                  act_scale,
+                                                                  d_out_q,
+                                                                  stream_);
+                        bitnet_cuda::nvfp4_quantize_a(d_out_q, B_, 1, rows, rows,
+                                                      d_a_nvfp4_f_, d_sfa_f_, stream_);
+                        return;
+                    }
+                }
                 gemm_noisy(d_x, d_w, d_w_noise, d_w_packed, d_w_packed_noise, d_scale,
                            d_w_nvfp4, d_w_sfb,
                            d_w_noise_nvfp4, d_w_noise_sfb,
