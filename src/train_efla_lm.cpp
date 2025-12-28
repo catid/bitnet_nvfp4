@@ -2743,14 +2743,30 @@ public:
                 const float* d_pos_t = d_pos_ + static_cast<size_t>(t) * H_;
                 if (use_transformer_residual) {
                     if (int8_residual) {
-                        efla_lm_cuda::add_pos_gelu_quantize(d_inproj_f_, d_pos_t, H_, B_, act_scale, d_x_q_, stream_);
+                        if (use_nvfp4) {
+                            bitnet_cuda::add_pos_gelu_quantize_nvfp4(d_inproj_f_, d_pos_t, H_, B_, act_scale,
+                                                                     d_x_q_, d_a_nvfp4_h_, d_sfa_h_, stream_);
+                        } else {
+                            efla_lm_cuda::add_pos_gelu_quantize(d_inproj_f_, d_pos_t, H_, B_, act_scale, d_x_q_, stream_);
+                        }
                         bump_version(d_x_q_);
+                        if (use_nvfp4) {
+                            set_nvfp4_act(d_x_q_, H_);
+                        }
                     } else {
                         efla_lm_cuda::add_pos_gelu(d_inproj_f_, d_pos_t, H_, B_, act_scale, d_res_f_, stream_);
                     }
                 } else {
-                    efla_lm_cuda::add_pos_gelu_quantize(d_inproj_f_, d_pos_t, H_, B_, act_scale, d_x_q_, stream_);
+                    if (use_nvfp4) {
+                        bitnet_cuda::add_pos_gelu_quantize_nvfp4(d_inproj_f_, d_pos_t, H_, B_, act_scale,
+                                                                 d_x_q_, d_a_nvfp4_h_, d_sfa_h_, stream_);
+                    } else {
+                        efla_lm_cuda::add_pos_gelu_quantize(d_inproj_f_, d_pos_t, H_, B_, act_scale, d_x_q_, stream_);
+                    }
                     bump_version(d_x_q_);
+                    if (use_nvfp4) {
+                        set_nvfp4_act(d_x_q_, H_);
+                    }
                 }
 
                 const size_t hh = static_cast<size_t>(H_) * H_;

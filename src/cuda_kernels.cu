@@ -2108,6 +2108,246 @@ __global__ void embedding_lookup_noise_quantize_nvfp4_warp16_kernel(const uint8_
 }
 
 template <typename LayoutSF>
+__global__ void add_pos_gelu_quantize_nvfp4_warp4_kernel(const float* __restrict__ in,
+                                                         const float* __restrict__ pos_t,
+                                                         int hidden,
+                                                         int batch,
+                                                         float act_scale,
+                                                         int8_t* __restrict__ out_q,
+                                                         cutlass::float_e2m1_t* __restrict__ out,
+                                                         cutlass::float_ue4m3_t* __restrict__ sf,
+                                                         LayoutSF layout_sf) {
+    const int row = static_cast<int>(blockIdx.x);
+    const int block = static_cast<int>(blockIdx.y);
+    const int k0 = block * kNvfp4SfVec;
+    if (row >= batch || k0 >= hidden) return;
+
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int base_in = row * hidden + k0;
+    const int base_out = row * hidden + k0;
+    constexpr unsigned kActiveMask = 0x0fu;
+    float max_abs = 0.0f;
+    int8_t v0 = 0, v1 = 0, v2 = 0, v3 = 0;
+    bool v0_ok = false, v1_ok = false, v2_ok = false, v3_ok = false;
+
+    if (lane < 4) {
+        const int k_base_load = k0 + lane * 4;
+        const int k0i = k_base_load + 0;
+        const int k1i = k_base_load + 1;
+        const int k2i = k_base_load + 2;
+        const int k3i = k_base_load + 3;
+        float f0 = 0.0f, f1 = 0.0f, f2 = 0.0f, f3 = 0.0f;
+        if (k0i < hidden) { f0 = in[base_in + lane * 4 + 0] + pos_t[k0i]; v0_ok = true; }
+        if (k1i < hidden) { f1 = in[base_in + lane * 4 + 1] + pos_t[k1i]; v1_ok = true; }
+        if (k2i < hidden) { f2 = in[base_in + lane * 4 + 2] + pos_t[k2i]; v2_ok = true; }
+        if (k3i < hidden) { f3 = in[base_in + lane * 4 + 3] + pos_t[k3i]; v3_ok = true; }
+
+        if (v0_ok) f0 = gelu(f0) * act_scale;
+        if (v1_ok) f1 = gelu(f1) * act_scale;
+        if (v2_ok) f2 = gelu(f2) * act_scale;
+        if (v3_ok) f3 = gelu(f3) * act_scale;
+
+        if (v0_ok) v0 = clip_int8(lrint_to_int(f0));
+        if (v1_ok) v1 = clip_int8(lrint_to_int(f1));
+        if (v2_ok) v2 = clip_int8(lrint_to_int(f2));
+        if (v3_ok) v3 = clip_int8(lrint_to_int(f3));
+
+        if (v0_ok) max_abs = fmaxf(max_abs, fabsf(static_cast<float>(v0)));
+        if (v1_ok) max_abs = fmaxf(max_abs, fabsf(static_cast<float>(v1)));
+        if (v2_ok) max_abs = fmaxf(max_abs, fabsf(static_cast<float>(v2)));
+        if (v3_ok) max_abs = fmaxf(max_abs, fabsf(static_cast<float>(v3)));
+        float tmp = max_abs;
+        tmp = fmaxf(tmp, __shfl_sync(kActiveMask, tmp, 1));
+        tmp = fmaxf(tmp, __shfl_sync(kActiveMask, tmp, 2));
+        tmp = fmaxf(tmp, __shfl_sync(kActiveMask, tmp, 3));
+        max_abs = __shfl_sync(kActiveMask, tmp, 0);
+
+        float scale_f = 1.0f;
+        typename cutlass::float_ue4m3_t::Storage scale_storage = 0;
+        if (lane == 0) {
+            float scale = (max_abs > 0.0f) ? (max_abs / 6.0f) : 1.0f;
+            cutlass::float_ue4m3_t scale_q(scale);
+            scale_f = static_cast<float>(scale_q);
+            if (scale_f == 0.0f) {
+                scale_q = cutlass::float_ue4m3_t(1.0f);
+                scale_f = 1.0f;
+            }
+            scale_storage = scale_q.storage;
+        }
+        const float scale_f_b = __shfl_sync(kActiveMask, scale_f, 0);
+        const auto scale_bits = static_cast<typename cutlass::float_ue4m3_t::Storage>(
+            __shfl_sync(kActiveMask, static_cast<int>(scale_storage), 0));
+        const uint8_t scale_u8 = static_cast<uint8_t>(scale_bits);
+        if (lane == 0) {
+            const auto sf_offset = layout_sf(cute::make_coord(row, k0, 0));
+            reinterpret_cast<uint8_t*>(sf)[sf_offset] = scale_u8;
+        }
+
+        const int k_base = k0 + lane * 4;
+        const bool full_block = (k0 + kNvfp4SfVec) <= hidden;
+        const bool packed_out_ok = full_block && ((base_in & 3) == 0);
+        if (packed_out_ok) {
+            const uint32_t packed_q = static_cast<uint32_t>(static_cast<uint8_t>(v0)) |
+                                      (static_cast<uint32_t>(static_cast<uint8_t>(v1)) << 8) |
+                                      (static_cast<uint32_t>(static_cast<uint8_t>(v2)) << 16) |
+                                      (static_cast<uint32_t>(static_cast<uint8_t>(v3)) << 24);
+            reinterpret_cast<uint32_t*>(out_q + base_in + (k_base - k0))[0] = packed_q;
+        } else {
+            if (v0_ok) out_q[base_in + (k_base - k0) + 0] = v0;
+            if (v1_ok) out_q[base_in + (k_base - k0) + 1] = v1;
+            if (v2_ok) out_q[base_in + (k_base - k0) + 2] = v2;
+            if (v3_ok) out_q[base_in + (k_base - k0) + 3] = v3;
+        }
+
+        const bool fast_path = full_block && ((hidden & 1) == 0);
+        if (!fast_path) {
+            if (v0_ok) {
+                const int idx = k_base + 0;
+                const float vf = static_cast<float>(v0) / scale_f_b;
+                const cutlass::float_e2m1_t q(vf);
+                cutlass::SubbyteReference<cutlass::float_e2m1_t> out_ref(out, base_out + (idx - k0));
+                out_ref = q;
+            }
+            if (v1_ok) {
+                const int idx = k_base + 1;
+                const float vf = static_cast<float>(v1) / scale_f_b;
+                const cutlass::float_e2m1_t q(vf);
+                cutlass::SubbyteReference<cutlass::float_e2m1_t> out_ref(out, base_out + (idx - k0));
+                out_ref = q;
+            }
+            if (v2_ok) {
+                const int idx = k_base + 2;
+                const float vf = static_cast<float>(v2) / scale_f_b;
+                const cutlass::float_e2m1_t q(vf);
+                cutlass::SubbyteReference<cutlass::float_e2m1_t> out_ref(out, base_out + (idx - k0));
+                out_ref = q;
+            }
+            if (v3_ok) {
+                const int idx = k_base + 3;
+                const float vf = static_cast<float>(v3) / scale_f_b;
+                const cutlass::float_e2m1_t q(vf);
+                cutlass::SubbyteReference<cutlass::float_e2m1_t> out_ref(out, base_out + (idx - k0));
+                out_ref = q;
+            }
+        } else {
+            uint8_t* out_bytes = reinterpret_cast<uint8_t*>(out);
+            const uint8_t q0_bits = static_cast<uint8_t>(
+                                    cutlass::float_e2m1_t(static_cast<float>(v0) / scale_f_b).storage) & 0x0fu;
+            const uint8_t q1_bits = static_cast<uint8_t>(
+                                    cutlass::float_e2m1_t(static_cast<float>(v1) / scale_f_b).storage) & 0x0fu;
+            const uint8_t q2_bits = static_cast<uint8_t>(
+                                    cutlass::float_e2m1_t(static_cast<float>(v2) / scale_f_b).storage) & 0x0fu;
+            const uint8_t q3_bits = static_cast<uint8_t>(
+                                    cutlass::float_e2m1_t(static_cast<float>(v3) / scale_f_b).storage) & 0x0fu;
+
+            const uint16_t packed = static_cast<uint16_t>(q0_bits | (q1_bits << 4) |
+                                                          (q2_bits << 8) | (q3_bits << 12));
+            const uint16_t p1 = __shfl_sync(kActiveMask, packed, 1);
+            const uint16_t p2 = __shfl_sync(kActiveMask, packed, 2);
+            const uint16_t p3 = __shfl_sync(kActiveMask, packed, 3);
+            if (lane == 0) {
+                const uint64_t packed64 = static_cast<uint64_t>(packed) |
+                                          (static_cast<uint64_t>(p1) << 16) |
+                                          (static_cast<uint64_t>(p2) << 32) |
+                                          (static_cast<uint64_t>(p3) << 48);
+                reinterpret_cast<uint64_t*>(out_bytes + (base_out >> 1))[0] = packed64;
+            }
+        }
+    }
+}
+
+template <typename LayoutSF>
+__global__ void add_pos_gelu_quantize_nvfp4_warp16_kernel(const float* __restrict__ in,
+                                                         const float* __restrict__ pos_t,
+                                                         int hidden,
+                                                         int batch,
+                                                         float act_scale,
+                                                         int8_t* __restrict__ out_q,
+                                                         cutlass::float_e2m1_t* __restrict__ out,
+                                                         cutlass::float_ue4m3_t* __restrict__ sf,
+                                                         LayoutSF layout_sf) {
+    const int row = static_cast<int>(blockIdx.x);
+    const int block = static_cast<int>(blockIdx.y);
+    const int k0 = block * kNvfp4SfVec;
+    if (row >= batch || k0 >= hidden) return;
+
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    constexpr unsigned kActiveMask = 0xffffu;
+    const int base_in = row * hidden + k0;
+    const int base_out = row * hidden + k0;
+
+    if (lane < 16) {
+        const int idx = k0 + lane;
+        float f = 0.0f;
+        bool ok = false;
+        if (idx < hidden) {
+            f = in[base_in + lane] + pos_t[idx];
+            f = gelu(f) * act_scale;
+            ok = true;
+        }
+        int8_t v = 0;
+        if (ok) v = clip_int8(lrint_to_int(f));
+        float max_abs = ok ? fabsf(static_cast<float>(v)) : 0.0f;
+        for (int offset = 8; offset > 0; offset >>= 1) {
+            max_abs = fmaxf(max_abs, __shfl_down_sync(kActiveMask, max_abs, offset));
+        }
+        max_abs = __shfl_sync(kActiveMask, max_abs, 0);
+
+        float scale_f = 1.0f;
+        typename cutlass::float_ue4m3_t::Storage scale_storage = 0;
+        if (lane == 0) {
+            float scale = (max_abs > 0.0f) ? (max_abs / 6.0f) : 1.0f;
+            cutlass::float_ue4m3_t scale_q(scale);
+            scale_f = static_cast<float>(scale_q);
+            if (scale_f == 0.0f) {
+                scale_q = cutlass::float_ue4m3_t(1.0f);
+                scale_f = 1.0f;
+            }
+            scale_storage = scale_q.storage;
+        }
+        const float scale_f_b = __shfl_sync(kActiveMask, scale_f, 0);
+        const auto scale_bits = static_cast<typename cutlass::float_ue4m3_t::Storage>(
+            __shfl_sync(kActiveMask, static_cast<int>(scale_storage), 0));
+        const uint8_t scale_u8 = static_cast<uint8_t>(scale_bits);
+        if (lane == 0) {
+            const auto sf_offset = layout_sf(cute::make_coord(row, k0, 0));
+            reinterpret_cast<uint8_t*>(sf)[sf_offset] = scale_u8;
+        }
+
+        if (idx < hidden) {
+            out_q[base_in + lane] = v;
+        }
+
+        const bool full_block = (k0 + kNvfp4SfVec) <= hidden;
+        const bool fast_path = full_block && ((hidden & 1) == 0);
+        if (!fast_path) {
+            if (idx < hidden) {
+                const float vf = static_cast<float>(v) / scale_f_b;
+                const cutlass::float_e2m1_t q(vf);
+                cutlass::SubbyteReference<cutlass::float_e2m1_t> out_ref(out, base_out + lane);
+                out_ref = q;
+            }
+        } else {
+            uint8_t nib = 0;
+            if (idx < hidden) {
+                const float vf = static_cast<float>(v) / scale_f_b;
+                nib = static_cast<uint8_t>(cutlass::float_e2m1_t(vf).storage) & 0x0fu;
+            }
+            if (lane == 0) {
+                uint64_t packed64 = 0;
+                #pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    const uint8_t n = static_cast<uint8_t>(__shfl_sync(kActiveMask, nib, i)) & 0x0fu;
+                    packed64 |= (static_cast<uint64_t>(n) << (4 * i));
+                }
+                uint8_t* out_bytes = reinterpret_cast<uint8_t*>(out);
+                reinterpret_cast<uint64_t*>(out_bytes + (base_out >> 1))[0] = packed64;
+            }
+        }
+    }
+}
+
+template <typename LayoutSF>
 __global__ void nvfp4_quantize_rowmajor_gelu_warp4_kernel(const float* __restrict__ in,
                                                           int rows,
                                                           int cols_in,
@@ -3663,6 +3903,46 @@ void embedding_lookup_noise_quantize_nvfp4(const uint8_t* d_tokens_t,
     }
 }
 
+void add_pos_gelu_quantize_nvfp4(const float* d_in,
+                                 const float* d_pos_t,
+                                 int hidden,
+                                 int batch,
+                                 float act_scale,
+                                 int8_t* d_out_q,
+                                 void* d_out_nvfp4,
+                                 void* d_sfa,
+                                 cudaStream_t stream) {
+    if (batch <= 0 || hidden <= 0) return;
+    using Sm1xxBlkScaledConfig = cutlass::detail::Sm1xxBlockScaledConfig<kNvfp4SfVec>;
+    auto layout_sfa = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(batch, 1, hidden, 1));
+    dim3 grid(static_cast<unsigned>(batch),
+              static_cast<unsigned>((hidden + kNvfp4SfVec - 1) / kNvfp4SfVec),
+              1);
+    if (g_nvfp4_quant_mode == bitnet_cuda::Nvfp4QuantMode::Warp4) {
+        add_pos_gelu_quantize_nvfp4_warp4_kernel<<<grid, 32, 0, stream>>>(
+            d_in,
+            d_pos_t,
+            hidden,
+            batch,
+            act_scale,
+            d_out_q,
+            static_cast<cutlass::float_e2m1_t*>(d_out_nvfp4),
+            static_cast<cutlass::float_ue4m3_t*>(d_sfa),
+            layout_sfa);
+    } else {
+        add_pos_gelu_quantize_nvfp4_warp16_kernel<<<grid, 32, 0, stream>>>(
+            d_in,
+            d_pos_t,
+            hidden,
+            batch,
+            act_scale,
+            d_out_q,
+            static_cast<cutlass::float_e2m1_t*>(d_out_nvfp4),
+            static_cast<cutlass::float_ue4m3_t*>(d_sfa),
+            layout_sfa);
+    }
+}
+
 void activation_quantize_nvfp4(const float* d_in,
                                int rows,
                                int cols_in,
@@ -4050,6 +4330,19 @@ void embedding_lookup_noise_quantize_nvfp4(const uint8_t* d_tokens_t,
                                            cudaStream_t stream) {
     (void)d_tokens_t; (void)token_stride; (void)d_emb_w; (void)d_emb_noise;
     (void)hidden; (void)batch; (void)noise_scale; (void)anti_sign;
+    (void)d_out_q; (void)d_out_nvfp4; (void)d_sfa; (void)stream;
+}
+
+void add_pos_gelu_quantize_nvfp4(const float* d_in,
+                                 const float* d_pos_t,
+                                 int hidden,
+                                 int batch,
+                                 float act_scale,
+                                 int8_t* d_out_q,
+                                 void* d_out_nvfp4,
+                                 void* d_sfa,
+                                 cudaStream_t stream) {
+    (void)d_in; (void)d_pos_t; (void)hidden; (void)batch; (void)act_scale;
     (void)d_out_q; (void)d_out_nvfp4; (void)d_sfa; (void)stream;
 }
 

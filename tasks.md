@@ -71,7 +71,7 @@
   - [ ] Experiment: compute loss in FP16 to reduce bandwidth.
 - [ ] embedding_lookup_noise (~1.0%) + add_pos_gelu_quantize (~0.9%).
   - [x] Experiment: fuse embedding lookup + quantize (NVFP4 path). (avg tok/s_total ~950k vs ~935k baseline; kept).
-  - [ ] Experiment: fuse add_pos + GELU + quantize into a single kernel.
+  - [x] Experiment: fuse add_pos + GELU + quantize into a single kernel. (avg tok/s_total ~967k vs ~950k baseline; kept).
 - [ ] CUDA API overhead (launch + memset + sync).
   - [ ] Experiment: reduce cudaMemsetAsync by initializing outputs in-kernel.
   - [ ] Experiment: remove cudaStreamSynchronize in NVFP4 paths (events instead).
