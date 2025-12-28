@@ -7,6 +7,7 @@
 #include <cutlass/layout/matrix.h>
 #include <cutlass/detail/sm100_blockscaled_layout.hpp>
 #include <cutlass/epilogue/collective/collective_builder.hpp>
+#include <cutlass/epilogue/thread/activation.h>
 #include <cutlass/float_subbyte.h>
 #include <cutlass/gemm/collective/collective_builder.hpp>
 #include <cutlass/gemm/dispatch_policy.hpp>
@@ -3147,14 +3148,17 @@ using Nvfp4ElementA = Nvfp4Element;
 using Nvfp4ElementB = Nvfp4Element;
 using Nvfp4ElementC = float;
 using Nvfp4ElementD = float;
+using Nvfp4ElementDInt8 = int8_t;
 using Nvfp4LayoutA = cutlass::layout::RowMajor;
 using Nvfp4LayoutB = cutlass::layout::ColumnMajor;
 using Nvfp4LayoutC = cutlass::layout::RowMajor;
 using Nvfp4LayoutD = cutlass::layout::RowMajor;
+using Nvfp4LayoutDInt8 = cutlass::layout::RowMajor;
 constexpr int kNvfp4AlignmentA = 32;
 constexpr int kNvfp4AlignmentB = 32;
 constexpr int kNvfp4AlignmentC = 128 / cutlass::sizeof_bits<Nvfp4ElementC>::value;
 constexpr int kNvfp4AlignmentD = 128 / cutlass::sizeof_bits<Nvfp4ElementD>::value;
+constexpr int kNvfp4AlignmentDInt8 = 128 / cutlass::sizeof_bits<Nvfp4ElementDInt8>::value;
 using Nvfp4Accumulator = float;
 using Nvfp4Arch = cutlass::arch::Sm120;
 using Nvfp4OpClass = cutlass::arch::OpClassBlockScaledTensorOp;
@@ -3171,6 +3175,24 @@ using Nvfp4CollectiveEpilogue = typename cutlass::epilogue::collective::Collecti
     cutlass::epilogue::collective::EpilogueScheduleAuto
   >::CollectiveOp;
 
+using Nvfp4GeluFusionOp = cutlass::epilogue::fusion::LinCombEltAct<
+    cutlass::epilogue::thread::ScaledGELU_taylor,
+    Nvfp4ElementDInt8,
+    Nvfp4Accumulator,
+    Nvfp4ElementC,
+    Nvfp4Accumulator>;
+
+using Nvfp4CollectiveEpilogueGeluI8 = typename cutlass::epilogue::collective::CollectiveBuilder<
+    Nvfp4Arch, Nvfp4OpClass,
+    Nvfp4ThreadBlockShape, Nvfp4ClusterShape,
+    cutlass::epilogue::collective::EpilogueTileAuto,
+    Nvfp4Accumulator, Nvfp4Accumulator,
+    Nvfp4ElementC, Nvfp4LayoutC, kNvfp4AlignmentC,
+    Nvfp4ElementDInt8, Nvfp4LayoutDInt8, kNvfp4AlignmentDInt8,
+    cutlass::epilogue::collective::EpilogueScheduleAuto,
+    Nvfp4GeluFusionOp
+  >::CollectiveOp;
+
 using Nvfp4StageAuto = cutlass::gemm::collective::StageCountAutoCarveout<
     static_cast<int>(sizeof(typename Nvfp4CollectiveEpilogue::SharedStorage))>;
 
@@ -3185,11 +3207,12 @@ using Nvfp4CollectiveMainloopT = typename cutlass::gemm::collective::CollectiveB
     ScheduleTag
   >::CollectiveOp;
 
-template <typename ScheduleTag, typename StageCountTag, typename TileSchedulerTag>
+template <typename ScheduleTag, typename StageCountTag, typename TileSchedulerTag,
+          typename EpilogueOp = Nvfp4CollectiveEpilogue>
 using Nvfp4GemmKernelT = cutlass::gemm::kernel::GemmUniversal<
     cute::Shape<int, int, int, int>,
     Nvfp4CollectiveMainloopT<ScheduleTag, StageCountTag>,
-    Nvfp4CollectiveEpilogue,
+    EpilogueOp,
     TileSchedulerTag>;
 
 template <typename ScheduleTag, typename StageCountTag>
@@ -3199,6 +3222,14 @@ using Nvfp4GemmPersistentT = cutlass::gemm::device::GemmUniversalAdapter<
 template <typename ScheduleTag, typename StageCountTag>
 using Nvfp4GemmStreamKT = cutlass::gemm::device::GemmUniversalAdapter<
     Nvfp4GemmKernelT<ScheduleTag, StageCountTag, cutlass::gemm::StreamKScheduler>>;
+
+template <typename ScheduleTag, typename StageCountTag>
+using Nvfp4GemmPersistentGeluI8T = cutlass::gemm::device::GemmUniversalAdapter<
+    Nvfp4GemmKernelT<ScheduleTag, StageCountTag, void, Nvfp4CollectiveEpilogueGeluI8>>;
+
+template <typename ScheduleTag, typename StageCountTag>
+using Nvfp4GemmStreamKGeluI8T = cutlass::gemm::device::GemmUniversalAdapter<
+    Nvfp4GemmKernelT<ScheduleTag, StageCountTag, cutlass::gemm::StreamKScheduler, Nvfp4CollectiveEpilogueGeluI8>>;
 
 using Nvfp4GemmAuto = Nvfp4GemmPersistentT<cutlass::gemm::collective::KernelScheduleAuto, Nvfp4StageAuto>;
 using Nvfp4GemmCooperative = Nvfp4GemmPersistentT<cutlass::gemm::KernelTmaWarpSpecializedCooperative, Nvfp4StageAuto>;
@@ -3239,6 +3270,44 @@ using Nvfp4GemmCooperativeSKS3 = Nvfp4GemmStreamKT<cutlass::gemm::KernelTmaWarpS
 using Nvfp4GemmCooperativeSKS4 = Nvfp4GemmStreamKT<cutlass::gemm::KernelTmaWarpSpecializedCooperative,
                                                    cutlass::gemm::collective::StageCount<4>>;
 
+using Nvfp4GemmGeluI8Auto = Nvfp4GemmPersistentGeluI8T<cutlass::gemm::collective::KernelScheduleAuto, Nvfp4StageAuto>;
+using Nvfp4GemmGeluI8Cooperative = Nvfp4GemmPersistentGeluI8T<cutlass::gemm::KernelTmaWarpSpecializedCooperative, Nvfp4StageAuto>;
+using Nvfp4GemmGeluI8Pingpong = Nvfp4GemmPersistentGeluI8T<cutlass::gemm::KernelTmaWarpSpecializedPingpong, Nvfp4StageAuto>;
+
+using Nvfp4GemmGeluI8AutoS2 = Nvfp4GemmPersistentGeluI8T<cutlass::gemm::collective::KernelScheduleAuto,
+                                             cutlass::gemm::collective::StageCount<2>>;
+using Nvfp4GemmGeluI8AutoS3 = Nvfp4GemmPersistentGeluI8T<cutlass::gemm::collective::KernelScheduleAuto,
+                                             cutlass::gemm::collective::StageCount<3>>;
+using Nvfp4GemmGeluI8AutoS4 = Nvfp4GemmPersistentGeluI8T<cutlass::gemm::collective::KernelScheduleAuto,
+                                             cutlass::gemm::collective::StageCount<4>>;
+using Nvfp4GemmGeluI8CooperativeS2 = Nvfp4GemmPersistentGeluI8T<cutlass::gemm::KernelTmaWarpSpecializedCooperative,
+                                                    cutlass::gemm::collective::StageCount<2>>;
+using Nvfp4GemmGeluI8CooperativeS3 = Nvfp4GemmPersistentGeluI8T<cutlass::gemm::KernelTmaWarpSpecializedCooperative,
+                                                    cutlass::gemm::collective::StageCount<3>>;
+using Nvfp4GemmGeluI8CooperativeS4 = Nvfp4GemmPersistentGeluI8T<cutlass::gemm::KernelTmaWarpSpecializedCooperative,
+                                                    cutlass::gemm::collective::StageCount<4>>;
+using Nvfp4GemmGeluI8PingpongS2 = Nvfp4GemmPersistentGeluI8T<cutlass::gemm::KernelTmaWarpSpecializedPingpong,
+                                                 cutlass::gemm::collective::StageCount<2>>;
+using Nvfp4GemmGeluI8PingpongS3 = Nvfp4GemmPersistentGeluI8T<cutlass::gemm::KernelTmaWarpSpecializedPingpong,
+                                                 cutlass::gemm::collective::StageCount<3>>;
+using Nvfp4GemmGeluI8PingpongS4 = Nvfp4GemmPersistentGeluI8T<cutlass::gemm::KernelTmaWarpSpecializedPingpong,
+                                                 cutlass::gemm::collective::StageCount<4>>;
+
+using Nvfp4GemmGeluI8AutoSK = Nvfp4GemmStreamKGeluI8T<cutlass::gemm::collective::KernelScheduleAuto, Nvfp4StageAuto>;
+using Nvfp4GemmGeluI8CooperativeSK = Nvfp4GemmStreamKGeluI8T<cutlass::gemm::KernelTmaWarpSpecializedCooperative, Nvfp4StageAuto>;
+
+using Nvfp4GemmGeluI8AutoSKS2 = Nvfp4GemmStreamKGeluI8T<cutlass::gemm::collective::KernelScheduleAuto,
+                                                cutlass::gemm::collective::StageCount<2>>;
+using Nvfp4GemmGeluI8AutoSKS3 = Nvfp4GemmStreamKGeluI8T<cutlass::gemm::collective::KernelScheduleAuto,
+                                                cutlass::gemm::collective::StageCount<3>>;
+using Nvfp4GemmGeluI8AutoSKS4 = Nvfp4GemmStreamKGeluI8T<cutlass::gemm::collective::KernelScheduleAuto,
+                                                cutlass::gemm::collective::StageCount<4>>;
+using Nvfp4GemmGeluI8CooperativeSKS2 = Nvfp4GemmStreamKGeluI8T<cutlass::gemm::KernelTmaWarpSpecializedCooperative,
+                                                       cutlass::gemm::collective::StageCount<2>>;
+using Nvfp4GemmGeluI8CooperativeSKS3 = Nvfp4GemmStreamKGeluI8T<cutlass::gemm::KernelTmaWarpSpecializedCooperative,
+                                                       cutlass::gemm::collective::StageCount<3>>;
+using Nvfp4GemmGeluI8CooperativeSKS4 = Nvfp4GemmStreamKGeluI8T<cutlass::gemm::KernelTmaWarpSpecializedCooperative,
+                                                       cutlass::gemm::collective::StageCount<4>>;
 template <typename Gemm>
 struct Nvfp4GemmCacheEntry {
     int m = 0;
@@ -3345,6 +3414,73 @@ static typename Gemm::Arguments nvfp4_make_args(const void* d_a,
 }
 
 template <typename Gemm>
+static typename Gemm::Arguments nvfp4_make_args_gelu_i8(const void* d_a,
+                                                        const void* d_b,
+                                                        const void* d_sfa,
+                                                        const void* d_sfb,
+                                                        int m, int n, int k,
+                                                        float alpha,
+                                                        float beta,
+                                                        const float* d_c,
+                                                        float act_scale,
+                                                        int8_t* d_d) {
+    using StrideA = typename Gemm::GemmKernel::StrideA;
+    using StrideB = typename Gemm::GemmKernel::StrideB;
+    using StrideC = typename Gemm::GemmKernel::StrideC;
+    using StrideD = typename Gemm::GemmKernel::StrideD;
+    using Sm1xxBlkScaledConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
+
+    auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, {m, k, 1});
+    auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, {n, k, 1});
+    auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, {m, n, 1});
+    auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, {m, n, 1});
+    auto layout_sfa = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(m, n, k, 1));
+    auto layout_sfb = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(m, n, k, 1));
+
+    typename Gemm::Arguments args{};
+    args.mode = cutlass::gemm::GemmUniversalMode::kGemm;
+    args.problem_shape = {m, n, k, 1};
+    args.mainloop = {
+        static_cast<const Nvfp4ElementA::DataType*>(d_a), stride_A,
+        static_cast<const Nvfp4ElementB::DataType*>(d_b), stride_B,
+        static_cast<const Nvfp4ElementA::ScaleFactorType*>(d_sfa), layout_sfa,
+        static_cast<const Nvfp4ElementB::ScaleFactorType*>(d_sfb), layout_sfb
+    };
+    args.epilogue.ptr_C = d_c;
+    args.epilogue.dC = stride_C;
+    args.epilogue.ptr_D = d_d;
+    args.epilogue.dD = stride_D;
+    args.epilogue.thread.alpha = alpha;
+    args.epilogue.thread.beta = beta;
+    args.epilogue.thread.activation.scale = act_scale;
+
+    auto& sched = args.scheduler;
+    if constexpr (Nvfp4HasSplits<decltype(sched)>::value) {
+        sched.splits = g_nvfp4_splits;
+    }
+    if constexpr (Nvfp4HasDecomposition<decltype(sched)>::value) {
+        using DecompT = decltype(sched.decomposition_mode);
+        switch (g_nvfp4_decomp) {
+            case bitnet_cuda::Nvfp4Decomposition::DataParallel:
+                sched.decomposition_mode = DecompT::DataParallel;
+                break;
+            case bitnet_cuda::Nvfp4Decomposition::SplitK:
+                sched.decomposition_mode = DecompT::SplitK;
+                break;
+            case bitnet_cuda::Nvfp4Decomposition::StreamK:
+                sched.decomposition_mode = DecompT::StreamK;
+                break;
+            case bitnet_cuda::Nvfp4Decomposition::Heuristic:
+            default:
+                sched.decomposition_mode = DecompT::Heuristic;
+                break;
+        }
+    }
+
+    return args;
+}
+
+template <typename Gemm>
 static bool nvfp4_prepare_entry(Nvfp4GemmCacheEntry<Gemm>* entry,
                                 const typename Gemm::Arguments& args,
                                 cudaStream_t stream) {
@@ -3414,6 +3550,52 @@ static void nvfp4_gemm_run_impl(const void* d_a,
                                 cudaStream_t stream) {
     if (m <= 0 || n <= 0 || k <= 0) return;
     auto args = nvfp4_make_args<Gemm>(d_a, d_b, d_sfa, d_sfb, m, n, k, alpha, beta, d_c, d_d);
+    auto* entry = nvfp4_get_cache_entry<Gemm>(m, n, k);
+    if (!entry || !entry->initialized) {
+        if (!nvfp4_prepare_entry(entry, args, stream)) {
+            return;
+        }
+    }
+    if (entry->gemm.update(args) != cutlass::Status::kSuccess) {
+        return;
+    }
+    entry->gemm.run(stream);
+}
+
+template <typename Gemm>
+static bool nvfp4_prepare_gemm_impl_gelu_i8(const void* d_a,
+                                            const void* d_b,
+                                            const void* d_sfa,
+                                            const void* d_sfb,
+                                            int m, int n, int k,
+                                            float alpha,
+                                            float beta,
+                                            const float* d_c,
+                                            float act_scale,
+                                            int8_t* d_d,
+                                            cudaStream_t stream) {
+    if (m <= 0 || n <= 0 || k <= 0) return false;
+    auto args = nvfp4_make_args_gelu_i8<Gemm>(d_a, d_b, d_sfa, d_sfb, m, n, k,
+                                              alpha, beta, d_c, act_scale, d_d);
+    auto* entry = nvfp4_get_cache_entry<Gemm>(m, n, k);
+    return nvfp4_prepare_entry(entry, args, stream);
+}
+
+template <typename Gemm>
+static void nvfp4_gemm_run_impl_gelu_i8(const void* d_a,
+                                        const void* d_b,
+                                        const void* d_sfa,
+                                        const void* d_sfb,
+                                        int m, int n, int k,
+                                        float alpha,
+                                        float beta,
+                                        const float* d_c,
+                                        float act_scale,
+                                        int8_t* d_d,
+                                        cudaStream_t stream) {
+    if (m <= 0 || n <= 0 || k <= 0) return;
+    auto args = nvfp4_make_args_gelu_i8<Gemm>(d_a, d_b, d_sfa, d_sfb, m, n, k,
+                                              alpha, beta, d_c, act_scale, d_d);
     auto* entry = nvfp4_get_cache_entry<Gemm>(m, n, k);
     if (!entry || !entry->initialized) {
         if (!nvfp4_prepare_entry(entry, args, stream)) {
@@ -4289,6 +4471,140 @@ void gemm_ternary_f_nvfp4(const void* d_a,
     (void)m; (void)n; (void)k; (void)alpha; (void)beta; (void)d_c; (void)d_d; (void)stream;
 #endif
 }
+
+void gemm_ternary_f_nvfp4_gelu_i8(const void* d_a,
+                                  const void* d_b,
+                                  const void* d_sfa,
+                                  const void* d_sfb,
+                                  int m, int n, int k,
+                                  float alpha,
+                                  float beta,
+                                  const float* d_c,
+                                  float act_scale,
+                                  int8_t* d_d,
+                                  cudaStream_t stream) {
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+    const bool use_streamk = nvfp4_use_streamk();
+    if (use_streamk) {
+        switch (g_nvfp4_schedule) {
+            case bitnet_cuda::Nvfp4Schedule::Pingpong:
+            case bitnet_cuda::Nvfp4Schedule::Cooperative:
+                switch (g_nvfp4_stage_count) {
+                    case bitnet_cuda::Nvfp4StageCount::Stages2:
+                        nvfp4_gemm_run_impl_gelu_i8<Nvfp4GemmGeluI8CooperativeSKS2>(d_a, d_b, d_sfa, d_sfb,
+                                                                                   m, n, k, alpha, beta, d_c, act_scale, d_d, stream);
+                        break;
+                    case bitnet_cuda::Nvfp4StageCount::Stages3:
+                        nvfp4_gemm_run_impl_gelu_i8<Nvfp4GemmGeluI8CooperativeSKS3>(d_a, d_b, d_sfa, d_sfb,
+                                                                                   m, n, k, alpha, beta, d_c, act_scale, d_d, stream);
+                        break;
+                    case bitnet_cuda::Nvfp4StageCount::Stages4:
+                        nvfp4_gemm_run_impl_gelu_i8<Nvfp4GemmGeluI8CooperativeSKS4>(d_a, d_b, d_sfa, d_sfb,
+                                                                                   m, n, k, alpha, beta, d_c, act_scale, d_d, stream);
+                        break;
+                    case bitnet_cuda::Nvfp4StageCount::Auto:
+                    default:
+                        nvfp4_gemm_run_impl_gelu_i8<Nvfp4GemmGeluI8CooperativeSK>(d_a, d_b, d_sfa, d_sfb,
+                                                                                 m, n, k, alpha, beta, d_c, act_scale, d_d, stream);
+                        break;
+                }
+                break;
+            case bitnet_cuda::Nvfp4Schedule::Auto:
+            default:
+                switch (g_nvfp4_stage_count) {
+                    case bitnet_cuda::Nvfp4StageCount::Stages2:
+                        nvfp4_gemm_run_impl_gelu_i8<Nvfp4GemmGeluI8AutoSKS2>(d_a, d_b, d_sfa, d_sfb,
+                                                                            m, n, k, alpha, beta, d_c, act_scale, d_d, stream);
+                        break;
+                    case bitnet_cuda::Nvfp4StageCount::Stages3:
+                        nvfp4_gemm_run_impl_gelu_i8<Nvfp4GemmGeluI8AutoSKS3>(d_a, d_b, d_sfa, d_sfb,
+                                                                            m, n, k, alpha, beta, d_c, act_scale, d_d, stream);
+                        break;
+                    case bitnet_cuda::Nvfp4StageCount::Stages4:
+                        nvfp4_gemm_run_impl_gelu_i8<Nvfp4GemmGeluI8AutoSKS4>(d_a, d_b, d_sfa, d_sfb,
+                                                                            m, n, k, alpha, beta, d_c, act_scale, d_d, stream);
+                        break;
+                    case bitnet_cuda::Nvfp4StageCount::Auto:
+                    default:
+                        nvfp4_gemm_run_impl_gelu_i8<Nvfp4GemmGeluI8AutoSK>(d_a, d_b, d_sfa, d_sfb,
+                                                                          m, n, k, alpha, beta, d_c, act_scale, d_d, stream);
+                        break;
+                }
+                break;
+        }
+    } else {
+        switch (g_nvfp4_schedule) {
+            case bitnet_cuda::Nvfp4Schedule::Pingpong:
+                switch (g_nvfp4_stage_count) {
+                    case bitnet_cuda::Nvfp4StageCount::Stages2:
+                        nvfp4_gemm_run_impl_gelu_i8<Nvfp4GemmGeluI8PingpongS2>(d_a, d_b, d_sfa, d_sfb,
+                                                                              m, n, k, alpha, beta, d_c, act_scale, d_d, stream);
+                        break;
+                    case bitnet_cuda::Nvfp4StageCount::Stages3:
+                        nvfp4_gemm_run_impl_gelu_i8<Nvfp4GemmGeluI8PingpongS3>(d_a, d_b, d_sfa, d_sfb,
+                                                                              m, n, k, alpha, beta, d_c, act_scale, d_d, stream);
+                        break;
+                    case bitnet_cuda::Nvfp4StageCount::Stages4:
+                        nvfp4_gemm_run_impl_gelu_i8<Nvfp4GemmGeluI8PingpongS4>(d_a, d_b, d_sfa, d_sfb,
+                                                                              m, n, k, alpha, beta, d_c, act_scale, d_d, stream);
+                        break;
+                    case bitnet_cuda::Nvfp4StageCount::Auto:
+                    default:
+                        nvfp4_gemm_run_impl_gelu_i8<Nvfp4GemmGeluI8Pingpong>(d_a, d_b, d_sfa, d_sfb,
+                                                                            m, n, k, alpha, beta, d_c, act_scale, d_d, stream);
+                        break;
+                }
+                break;
+            case bitnet_cuda::Nvfp4Schedule::Cooperative:
+                switch (g_nvfp4_stage_count) {
+                    case bitnet_cuda::Nvfp4StageCount::Stages2:
+                        nvfp4_gemm_run_impl_gelu_i8<Nvfp4GemmGeluI8CooperativeS2>(d_a, d_b, d_sfa, d_sfb,
+                                                                                 m, n, k, alpha, beta, d_c, act_scale, d_d, stream);
+                        break;
+                    case bitnet_cuda::Nvfp4StageCount::Stages3:
+                        nvfp4_gemm_run_impl_gelu_i8<Nvfp4GemmGeluI8CooperativeS3>(d_a, d_b, d_sfa, d_sfb,
+                                                                                 m, n, k, alpha, beta, d_c, act_scale, d_d, stream);
+                        break;
+                    case bitnet_cuda::Nvfp4StageCount::Stages4:
+                        nvfp4_gemm_run_impl_gelu_i8<Nvfp4GemmGeluI8CooperativeS4>(d_a, d_b, d_sfa, d_sfb,
+                                                                                 m, n, k, alpha, beta, d_c, act_scale, d_d, stream);
+                        break;
+                    case bitnet_cuda::Nvfp4StageCount::Auto:
+                    default:
+                        nvfp4_gemm_run_impl_gelu_i8<Nvfp4GemmGeluI8Cooperative>(d_a, d_b, d_sfa, d_sfb,
+                                                                                m, n, k, alpha, beta, d_c, act_scale, d_d, stream);
+                        break;
+                }
+                break;
+            case bitnet_cuda::Nvfp4Schedule::Auto:
+            default:
+                switch (g_nvfp4_stage_count) {
+                    case bitnet_cuda::Nvfp4StageCount::Stages2:
+                        nvfp4_gemm_run_impl_gelu_i8<Nvfp4GemmGeluI8AutoS2>(d_a, d_b, d_sfa, d_sfb,
+                                                                          m, n, k, alpha, beta, d_c, act_scale, d_d, stream);
+                        break;
+                    case bitnet_cuda::Nvfp4StageCount::Stages3:
+                        nvfp4_gemm_run_impl_gelu_i8<Nvfp4GemmGeluI8AutoS3>(d_a, d_b, d_sfa, d_sfb,
+                                                                          m, n, k, alpha, beta, d_c, act_scale, d_d, stream);
+                        break;
+                    case bitnet_cuda::Nvfp4StageCount::Stages4:
+                        nvfp4_gemm_run_impl_gelu_i8<Nvfp4GemmGeluI8AutoS4>(d_a, d_b, d_sfa, d_sfb,
+                                                                          m, n, k, alpha, beta, d_c, act_scale, d_d, stream);
+                        break;
+                    case bitnet_cuda::Nvfp4StageCount::Auto:
+                    default:
+                        nvfp4_gemm_run_impl_gelu_i8<Nvfp4GemmGeluI8Auto>(d_a, d_b, d_sfa, d_sfb,
+                                                                        m, n, k, alpha, beta, d_c, act_scale, d_d, stream);
+                        break;
+                }
+                break;
+        }
+    }
+#else
+    (void)d_a; (void)d_b; (void)d_sfa; (void)d_sfb;
+    (void)m; (void)n; (void)k; (void)alpha; (void)beta; (void)d_c; (void)act_scale; (void)d_d; (void)stream;
+#endif
+}
 #else
 void gemm_ternary_f_cutlass(const int8_t* d_x, const int8_t* d_w,
                             int rows, int cols, int batch,
@@ -4344,6 +4660,22 @@ void add_pos_gelu_quantize_nvfp4(const float* d_in,
                                  cudaStream_t stream) {
     (void)d_in; (void)d_pos_t; (void)hidden; (void)batch; (void)act_scale;
     (void)d_out_q; (void)d_out_nvfp4; (void)d_sfa; (void)stream;
+}
+
+void gemm_ternary_f_nvfp4_gelu_i8(const void* d_a,
+                                  const void* d_b,
+                                  const void* d_sfa,
+                                  const void* d_sfb,
+                                  int m, int n, int k,
+                                  float alpha,
+                                  float beta,
+                                  const float* d_c,
+                                  float act_scale,
+                                  int8_t* d_d,
+                                  cudaStream_t stream) {
+    (void)d_a; (void)d_b; (void)d_sfa; (void)d_sfb;
+    (void)m; (void)n; (void)k; (void)alpha; (void)beta;
+    (void)d_c; (void)act_scale; (void)d_d; (void)stream;
 }
 
 void activation_quantize_nvfp4(const float* d_in,

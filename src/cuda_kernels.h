@@ -437,4 +437,18 @@ void gemm_ternary_f_nvfp4(const void* d_a,
                           float* d_d,
                           cudaStream_t stream);
 
+// NVFP4 block-scaled GEMM with fused GELU+scale into int8 output:
+// D = GELU(alpha * A * B + beta * C) * act_scale
+void gemm_ternary_f_nvfp4_gelu_i8(const void* d_a,
+                                  const void* d_b,
+                                  const void* d_sfa,
+                                  const void* d_sfb,
+                                  int m, int n, int k,
+                                  float alpha,
+                                  float beta,
+                                  const float* d_c,
+                                  float act_scale,
+                                  int8_t* d_d,
+                                  cudaStream_t stream);
+
 } // namespace bitnet_cuda
