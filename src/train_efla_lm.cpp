@@ -212,7 +212,7 @@ struct TrainConfig {
     bool use_qkv_split_bias = false;
     bool use_fused_ff1 = true;
     bool use_fused_noise_gemm = true;
-    bool use_fused_efla = false;
+    bool use_fused_efla = true;
     bool use_efla_mixed = false;
     bool use_efla_fuse_diff = false;
     bool use_efla_update_wmma = false;
@@ -3911,7 +3911,7 @@ int main(int argc, char** argv) {
                 "  --nvfp4_stages {auto|2|3|4} (default auto)\n"
                 "  --nvfp4_decomp {auto|data|splitk|streamk} (default auto)\n"
                 "  --nvfp4_splits N  split-K factor for nvfp4 (default 1)\n"
-                "  --efla_fused      use single-kernel EFLA step (default off)\n"
+                "  --efla_fused      use single-kernel EFLA step (default on)\n"
                 "  --no_efla_fused   disable fused EFLA step\n"
                 "  --efla_mixed      store k_usage/diff in FP16 during EFLA step (default off)\n"
                 "  --no_efla_mixed   disable mixed-precision EFLA step\n"
