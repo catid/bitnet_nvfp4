@@ -973,6 +973,10 @@ public:
             d_wbeta_noise_sfb_.resize(static_cast<size_t>(L_), nullptr);
             d_ff1_noise_sfb_.resize(static_cast<size_t>(L_), nullptr);
             d_ff2_noise_sfb_.resize(static_cast<size_t>(L_), nullptr);
+            if (use_fused_qkv_nvfp4_) {
+                d_wqkv_noise_nvfp4_.resize(static_cast<size_t>(L_), nullptr);
+                d_wqkv_noise_sfb_.resize(static_cast<size_t>(L_), nullptr);
+            }
 
             for (int l = 0; l < L_; ++l) {
                 alloc_nvfp4_b(H_, H_, &d_wq_noise_nvfp4_[static_cast<size_t>(l)],
@@ -987,6 +991,12 @@ public:
                               &d_ff1_noise_sfb_[static_cast<size_t>(l)], "cudaMalloc nvfp4 ff1_noise");
                 alloc_nvfp4_b(H_, F_, &d_ff2_noise_nvfp4_[static_cast<size_t>(l)],
                               &d_ff2_noise_sfb_[static_cast<size_t>(l)], "cudaMalloc nvfp4 ff2_noise");
+                if (use_fused_qkv_nvfp4_) {
+                    alloc_nvfp4_b(qkv_fused_cols_, H_,
+                                  &d_wqkv_noise_nvfp4_[static_cast<size_t>(l)],
+                                  &d_wqkv_noise_sfb_[static_cast<size_t>(l)],
+                                  "cudaMalloc nvfp4 wqkv_noise");
+                }
             }
         }
 
@@ -1160,12 +1170,14 @@ public:
         for (void* p : d_wv_noise_sfb_) if (p) cudaFree(p);
         for (void* p : d_wk_noise_sfb_) if (p) cudaFree(p);
         for (void* p : d_wq_noise_sfb_) if (p) cudaFree(p);
+        for (void* p : d_wqkv_noise_sfb_) if (p) cudaFree(p);
         for (void* p : d_ff2_noise_nvfp4_) if (p) cudaFree(p);
         for (void* p : d_ff1_noise_nvfp4_) if (p) cudaFree(p);
         for (void* p : d_wbeta_noise_nvfp4_) if (p) cudaFree(p);
         for (void* p : d_wv_noise_nvfp4_) if (p) cudaFree(p);
         for (void* p : d_wk_noise_nvfp4_) if (p) cudaFree(p);
         for (void* p : d_wq_noise_nvfp4_) if (p) cudaFree(p);
+        for (void* p : d_wqkv_noise_nvfp4_) if (p) cudaFree(p);
         if (d_head_noise_sfb_) cudaFree(d_head_noise_sfb_);
         if (d_win_noise_sfb_) cudaFree(d_win_noise_sfb_);
         if (d_emb_noise_sfb_) cudaFree(d_emb_noise_sfb_);
@@ -1431,22 +1443,44 @@ public:
                                       d_head_noise_nvfp4_, d_head_noise_sfb_, stream_);
         const size_t hh = static_cast<size_t>(H_) * static_cast<size_t>(H_);
         const size_t hf = static_cast<size_t>(H_) * static_cast<size_t>(F_);
+        const bool has_fused_noise = use_fused_qkv_nvfp4_ &&
+                                     qkv_fused_cols_ > 0 &&
+                                     !d_wqkv_noise_nvfp4_.empty() &&
+                                     !d_wqkv_noise_sfb_.empty();
         for (int l = 0; l < L_; ++l) {
             const size_t off_hh = static_cast<size_t>(l) * hh;
             const size_t off_h = static_cast<size_t>(l) * static_cast<size_t>(H_);
             const size_t off_hf = static_cast<size_t>(l) * hf;
-            bitnet_cuda::nvfp4_quantize_b(d_wq_noise_ + off_hh, B_, H_, H_, H_,
-                                          d_wq_noise_nvfp4_[static_cast<size_t>(l)],
-                                          d_wq_noise_sfb_[static_cast<size_t>(l)], stream_);
-            bitnet_cuda::nvfp4_quantize_b(d_wk_noise_ + off_hh, B_, H_, H_, H_,
-                                          d_wk_noise_nvfp4_[static_cast<size_t>(l)],
-                                          d_wk_noise_sfb_[static_cast<size_t>(l)], stream_);
-            bitnet_cuda::nvfp4_quantize_b(d_wv_noise_ + off_hh, B_, H_, H_, H_,
-                                          d_wv_noise_nvfp4_[static_cast<size_t>(l)],
-                                          d_wv_noise_sfb_[static_cast<size_t>(l)], stream_);
-            bitnet_cuda::nvfp4_quantize_b(d_wbeta_noise_ + off_h, B_, 1, H_, H_,
-                                          d_wbeta_noise_nvfp4_[static_cast<size_t>(l)],
-                                          d_wbeta_noise_sfb_[static_cast<size_t>(l)], stream_);
+            const bool fused_qkv_noise = has_fused_noise &&
+                                         d_wqkv_noise_nvfp4_[static_cast<size_t>(l)] &&
+                                         d_wqkv_noise_sfb_[static_cast<size_t>(l)];
+            if (fused_qkv_noise) {
+                bitnet_cuda::nvfp4_quantize_wqkv_fused(d_wq_noise_ + off_hh,
+                                                       d_wk_noise_ + off_hh,
+                                                       d_wv_noise_ + off_hh,
+                                                       d_wbeta_noise_ + off_h,
+                                                       B_, H_, H_, qkv_fused_cols_,
+                                                       q_out_scale_,
+                                                       k_out_scale_,
+                                                       v_out_scale_,
+                                                       beta_out_scale_,
+                                                       d_wqkv_noise_nvfp4_[static_cast<size_t>(l)],
+                                                       d_wqkv_noise_sfb_[static_cast<size_t>(l)],
+                                                       stream_);
+            } else {
+                bitnet_cuda::nvfp4_quantize_b(d_wq_noise_ + off_hh, B_, H_, H_, H_,
+                                              d_wq_noise_nvfp4_[static_cast<size_t>(l)],
+                                              d_wq_noise_sfb_[static_cast<size_t>(l)], stream_);
+                bitnet_cuda::nvfp4_quantize_b(d_wk_noise_ + off_hh, B_, H_, H_, H_,
+                                              d_wk_noise_nvfp4_[static_cast<size_t>(l)],
+                                              d_wk_noise_sfb_[static_cast<size_t>(l)], stream_);
+                bitnet_cuda::nvfp4_quantize_b(d_wv_noise_ + off_hh, B_, H_, H_, H_,
+                                              d_wv_noise_nvfp4_[static_cast<size_t>(l)],
+                                              d_wv_noise_sfb_[static_cast<size_t>(l)], stream_);
+                bitnet_cuda::nvfp4_quantize_b(d_wbeta_noise_ + off_h, B_, 1, H_, H_,
+                                              d_wbeta_noise_nvfp4_[static_cast<size_t>(l)],
+                                              d_wbeta_noise_sfb_[static_cast<size_t>(l)], stream_);
+            }
             bitnet_cuda::nvfp4_quantize_b(d_ff1_noise_ + off_hf, B_, F_, H_, H_,
                                           d_ff1_noise_nvfp4_[static_cast<size_t>(l)],
                                           d_ff1_noise_sfb_[static_cast<size_t>(l)], stream_);
@@ -2373,6 +2407,8 @@ public:
                                  const void* wb_noise_sfb,
                                  const void* wqkv_nvfp4,
                                  const void* wqkv_sfb,
+                                 const void* wqkv_noise_nvfp4,
+                                 const void* wqkv_noise_sfb,
                                  const float* d_scale,
                                  int rows,
                                  int cols,
@@ -2413,13 +2449,26 @@ public:
                         const int fused_rows_valid = rows * 3 + 1;
                         const int fused_rows = use_fused_qkv_nvfp4_ ? qkv_fused_cols_ : fused_rows_valid;
                         const bool nvfp4_beta_ok = ((1 & 31) == 0);
-                        if (use_fused_qkv_nvfp4_ && fused_rows > 0 && wqkv_nvfp4 && wqkv_sfb && d_qkv_f_) {
+                        bool fused_noise = false;
+                        const bool use_fused_qkv = use_fused_qkv_nvfp4_ && fused_rows > 0 &&
+                                                   wqkv_nvfp4 && wqkv_sfb && d_qkv_f_;
+                        if (use_fused_qkv) {
                             bitnet_cuda::gemm_ternary_f_nvfp4(act.first, wqkv_nvfp4,
                                                               act.second, wqkv_sfb,
                                                               B_, fused_rows, cols,
                                                               1.0f, 0.0f,
                                                               d_qkv_f_, d_qkv_f_,
                                                               stream_);
+                            if (noise_active && wqkv_noise_nvfp4 && wqkv_noise_sfb) {
+                                const float alpha = static_cast<float>(anti_sign) * noise_scale;
+                                bitnet_cuda::gemm_ternary_f_nvfp4(act.first, wqkv_noise_nvfp4,
+                                                                  act.second, wqkv_noise_sfb,
+                                                                  B_, fused_rows, cols,
+                                                                  alpha, 1.0f,
+                                                                  d_qkv_f_, d_qkv_f_,
+                                                                  stream_);
+                                fused_noise = true;
+                            }
                             if (use_qkv_split_kernel_) {
                                 const float bias = fuse_beta_bias ? beta_bias_eff : 0.0f;
                                 bitnet_cuda::split_qkvb_fused(d_qkv_f_, B_, rows, fused_rows, d_q, d_k, d_v, d_beta,
@@ -2487,7 +2536,7 @@ public:
                                                             stream_);
                             }
                         }
-                        if (noise_active) {
+                        if (noise_active && !fused_noise) {
                             if (wq_n) {
                                 if (wq_noise_nvfp4 && wq_noise_sfb) {
                                     const float alpha = q_scale * static_cast<float>(anti_sign) * noise_scale;
@@ -2734,6 +2783,10 @@ public:
                             const void* wf2_noise_sfb = (use_nvfp4_ ? d_ff2_noise_sfb_[static_cast<size_t>(l)] : nullptr);
                             const void* wqkv_nvfp4 = (use_fused_qkv_nvfp4_ ? d_wqkv_nvfp4_[static_cast<size_t>(l)] : nullptr);
                             const void* wqkv_sfb = (use_fused_qkv_nvfp4_ ? d_wqkv_sfb_[static_cast<size_t>(l)] : nullptr);
+                            const void* wqkv_noise_nvfp4 =
+                                (use_fused_qkv_nvfp4_ ? d_wqkv_noise_nvfp4_[static_cast<size_t>(l)] : nullptr);
+                            const void* wqkv_noise_sfb =
+                                (use_fused_qkv_nvfp4_ ? d_wqkv_noise_sfb_[static_cast<size_t>(l)] : nullptr);
                             const uint32_t* wq_p = use_packed_gemm_ ? (d_wq_packed_ + l_off_hh_p) : nullptr;
                             const uint32_t* wk_p = use_packed_gemm_ ? (d_wk_packed_ + l_off_hh_p) : nullptr;
                             const uint32_t* wv_p = use_packed_gemm_ ? (d_wv_packed_ + l_off_hh_p) : nullptr;
@@ -2775,6 +2828,7 @@ public:
                                       wq_noise_nvfp4, wk_noise_nvfp4, wv_noise_nvfp4, wb_noise_nvfp4,
                                       wq_noise_sfb, wk_noise_sfb, wv_noise_sfb, wb_noise_sfb,
                                       wqkv_nvfp4, wqkv_sfb,
+                                      wqkv_noise_nvfp4, wqkv_noise_sfb,
                                       d_scale_x_, H_, H_,
                                       q_out_scale_, k_out_scale_, v_out_scale_, beta_out_scale_,
                                       beta_bias_eff, fuse_beta_bias,
@@ -2882,6 +2936,10 @@ public:
                             const void* wf2_noise_sfb = (use_nvfp4_ ? d_ff2_noise_sfb_[static_cast<size_t>(l)] : nullptr);
                             const void* wqkv_nvfp4 = (use_fused_qkv_nvfp4_ ? d_wqkv_nvfp4_[static_cast<size_t>(l)] : nullptr);
                             const void* wqkv_sfb = (use_fused_qkv_nvfp4_ ? d_wqkv_sfb_[static_cast<size_t>(l)] : nullptr);
+                            const void* wqkv_noise_nvfp4 =
+                                (use_fused_qkv_nvfp4_ ? d_wqkv_noise_nvfp4_[static_cast<size_t>(l)] : nullptr);
+                            const void* wqkv_noise_sfb =
+                                (use_fused_qkv_nvfp4_ ? d_wqkv_noise_sfb_[static_cast<size_t>(l)] : nullptr);
                             const uint32_t* wq_p = use_packed_gemm_ ? (d_wq_packed_ + l_off_hh_p) : nullptr;
                             const uint32_t* wk_p = use_packed_gemm_ ? (d_wk_packed_ + l_off_hh_p) : nullptr;
                             const uint32_t* wv_p = use_packed_gemm_ ? (d_wv_packed_ + l_off_hh_p) : nullptr;
@@ -2923,6 +2981,7 @@ public:
                                       wq_noise_nvfp4, wk_noise_nvfp4, wv_noise_nvfp4, wb_noise_nvfp4,
                                       wq_noise_sfb, wk_noise_sfb, wv_noise_sfb, wb_noise_sfb,
                                       wqkv_nvfp4, wqkv_sfb,
+                                      wqkv_noise_nvfp4, wqkv_noise_sfb,
                                       d_scale_x_, H_, H_,
                                       q_out_scale_, k_out_scale_, v_out_scale_, beta_out_scale_,
                                       beta_bias_eff, fuse_beta_bias,
@@ -3015,6 +3074,10 @@ public:
                         const void* wf2_noise_sfb = (use_nvfp4_ ? d_ff2_noise_sfb_[static_cast<size_t>(l)] : nullptr);
                         const void* wqkv_nvfp4 = (use_fused_qkv_nvfp4_ ? d_wqkv_nvfp4_[static_cast<size_t>(l)] : nullptr);
                         const void* wqkv_sfb = (use_fused_qkv_nvfp4_ ? d_wqkv_sfb_[static_cast<size_t>(l)] : nullptr);
+                        const void* wqkv_noise_nvfp4 =
+                            (use_fused_qkv_nvfp4_ ? d_wqkv_noise_nvfp4_[static_cast<size_t>(l)] : nullptr);
+                        const void* wqkv_noise_sfb =
+                            (use_fused_qkv_nvfp4_ ? d_wqkv_noise_sfb_[static_cast<size_t>(l)] : nullptr);
                         const uint32_t* wq_p = use_packed_gemm_ ? (d_wq_packed_ + l_off_hh_p) : nullptr;
                         const uint32_t* wk_p = use_packed_gemm_ ? (d_wk_packed_ + l_off_hh_p) : nullptr;
                         const uint32_t* wv_p = use_packed_gemm_ ? (d_wv_packed_ + l_off_hh_p) : nullptr;
@@ -3056,6 +3119,7 @@ public:
                                   wq_noise_nvfp4, wk_noise_nvfp4, wv_noise_nvfp4, wb_noise_nvfp4,
                                   wq_noise_sfb, wk_noise_sfb, wv_noise_sfb, wb_noise_sfb,
                                   wqkv_nvfp4, wqkv_sfb,
+                                  wqkv_noise_nvfp4, wqkv_noise_sfb,
                                   d_scale_x_, H_, H_,
                                   q_out_scale_, k_out_scale_, v_out_scale_, beta_out_scale_,
                                   beta_bias_eff, fuse_beta_bias,
@@ -3278,6 +3342,8 @@ private:
     std::vector<void*> d_ff2_sfb_;
     std::vector<void*> d_wqkv_nvfp4_;
     std::vector<void*> d_wqkv_sfb_;
+    std::vector<void*> d_wqkv_noise_nvfp4_;
+    std::vector<void*> d_wqkv_noise_sfb_;
     std::vector<void*> d_wq_noise_nvfp4_;
     std::vector<void*> d_wk_noise_nvfp4_;
     std::vector<void*> d_wv_noise_nvfp4_;
