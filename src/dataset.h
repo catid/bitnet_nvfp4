@@ -12,10 +12,12 @@ public:
     void sample_batch(int batch, int seq_len, uint64_t seed,
                       std::vector<std::vector<uint8_t>>& inputs,
                       std::vector<std::vector<uint8_t>>& targets) const;
+    void sample_batch_packed(int batch, int seq_len, uint64_t seed,
+                             uint8_t* inputs,
+                             uint8_t* targets) const;
 
     size_t size() const { return data_.size(); }
 
 private:
     std::vector<uint8_t> data_;
 };
-

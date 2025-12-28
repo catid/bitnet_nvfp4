@@ -223,6 +223,7 @@ struct TrainConfig {
     bool use_packed_update = false;
     int omp_threads = 0; // 0 = auto (use all available cores unless OMP_NUM_THREADS is set)
     bool noise_batch = true;
+    bool use_pinned_tokens = true;
 
     float update_threshold = 0.08f;
     float update_threshold_end = -1.0f;
@@ -1984,6 +1985,25 @@ public:
                                    cudaMemcpyHostToDevice, upload_stream_),
                    "cudaMemcpyAsync targets");
         cuda_check(cudaEventRecord(upload_done_[buffer_idx], upload_stream_), "cudaEventRecord upload_done");
+    }
+
+    void upload_tokens_async_packed(const uint8_t* inputs,
+                                    const uint8_t* targets,
+                                    int buffer_idx) {
+        if (buffer_idx < 0 || buffer_idx >= kTokenBuffers) {
+            throw std::runtime_error("upload_tokens_async_packed buffer index out of range");
+        }
+        if (!inputs || !targets) {
+            throw std::runtime_error("upload_tokens_async_packed null inputs/targets");
+        }
+        const size_t total = static_cast<size_t>(B_) * T_;
+        cuda_check(cudaMemcpyAsync(d_tokens_[buffer_idx], inputs, total,
+                                   cudaMemcpyHostToDevice, upload_stream_),
+                   "cudaMemcpyAsync tokens packed");
+        cuda_check(cudaMemcpyAsync(d_targets_[buffer_idx], targets, total,
+                                   cudaMemcpyHostToDevice, upload_stream_),
+                   "cudaMemcpyAsync targets packed");
+        cuda_check(cudaEventRecord(upload_done_[buffer_idx], upload_stream_), "cudaEventRecord upload_done packed");
     }
 
     void set_active_tokens(int buffer_idx) {
@@ -4196,6 +4216,8 @@ int main(int argc, char** argv) {
         else if (a == "--no_fused_noise_gemm") cfg.use_fused_noise_gemm = false;
         else if (a == "--noise_batch") cfg.noise_batch = true;
         else if (a == "--no_noise_batch") cfg.noise_batch = false;
+        else if (a == "--pinned_tokens") cfg.use_pinned_tokens = true;
+        else if (a == "--no_pinned_tokens") cfg.use_pinned_tokens = false;
         else if (a == "--gemm_backend") cfg.gemm_backend = parse_gemm_backend(next(i));
         else if (a == "--cutlass_gemm") cfg.gemm_backend = TrainConfig::GemmBackend::Cutlass;
         else if (a == "--cutlass_nvfp4") cfg.gemm_backend = TrainConfig::GemmBackend::CutlassNvfp4;
@@ -4337,6 +4359,8 @@ int main(int argc, char** argv) {
                 "  --no_fused_noise_gemm disable fused noise GEMM path\n"
                 "  --noise_batch     batch GPU noise fills in one launch (default on)\n"
                 "  --no_noise_batch  disable batched noise fill\n"
+                "  --pinned_tokens   stage token batches in pinned host memory (default on)\n"
+                "  --no_pinned_tokens disable pinned token staging\n"
                 "  --gemm_backend {dp4a|cutlass|nvfp4} (default nvfp4)\n"
                 "  --cutlass_gemm   use CUTLASS GEMM (unpacked only)\n"
                 "  --cutlass_nvfp4  use CUTLASS NVFP4 block-scaled GEMM (sm120+, hidden%128==0)\n"
@@ -4776,6 +4800,41 @@ int main(int argc, char** argv) {
 
         std::vector<std::vector<uint8_t>> inputs_cur, targets_cur;
         std::vector<std::vector<uint8_t>> inputs_next, targets_next;
+        constexpr int kTokenBuffers = 2;
+        uint8_t* h_inputs_pinned[kTokenBuffers] = {nullptr, nullptr};
+        uint8_t* h_targets_pinned[kTokenBuffers] = {nullptr, nullptr};
+        bool use_pinned_tokens = cfg.use_pinned_tokens;
+        if (use_pinned_tokens) {
+            cuda_check(cudaSetDevice(models[0]->device()), "cudaSetDevice pinned_tokens_alloc");
+            const size_t host_bytes = static_cast<size_t>(cfg.batch) * cfg.seq_len;
+            for (int i = 0; i < kTokenBuffers; ++i) {
+                cudaError_t err = cudaHostAlloc(reinterpret_cast<void**>(&h_inputs_pinned[i]),
+                                                host_bytes, cudaHostAllocPortable);
+                if (err != cudaSuccess) {
+                    use_pinned_tokens = false;
+                    break;
+                }
+                err = cudaHostAlloc(reinterpret_cast<void**>(&h_targets_pinned[i]),
+                                    host_bytes, cudaHostAllocPortable);
+                if (err != cudaSuccess) {
+                    use_pinned_tokens = false;
+                    break;
+                }
+            }
+            if (!use_pinned_tokens) {
+                for (int i = 0; i < kTokenBuffers; ++i) {
+                    if (h_inputs_pinned[i]) {
+                        cudaFreeHost(h_inputs_pinned[i]);
+                        h_inputs_pinned[i] = nullptr;
+                    }
+                    if (h_targets_pinned[i]) {
+                        cudaFreeHost(h_targets_pinned[i]);
+                        h_targets_pinned[i] = nullptr;
+                    }
+                }
+                std::cerr << "Pinned token staging disabled (cudaHostAlloc failed)\n";
+            }
+        }
         double cur_sample_s = 0.0;
         int buf_cur = 0;
         int buf_next = 1;
@@ -4787,7 +4846,12 @@ int main(int argc, char** argv) {
             const uint64_t seed0 = cfg.fixed_train
                                        ? cfg.data_seed
                                        : rng::mix(cfg.data_seed, static_cast<uint64_t>(0));
-            data.sample_batch(cfg.batch, cfg.seq_len, seed0, inputs_cur, targets_cur);
+            if (use_pinned_tokens) {
+                data.sample_batch_packed(cfg.batch, cfg.seq_len, seed0,
+                                         h_inputs_pinned[buf_cur], h_targets_pinned[buf_cur]);
+            } else {
+                data.sample_batch(cfg.batch, cfg.seq_len, seed0, inputs_cur, targets_cur);
+            }
             cur_sample_s = seconds_since(t0);
         }
 
@@ -4820,11 +4884,22 @@ int main(int argc, char** argv) {
                 prefetch_active = true;
                 prefetch_future = pool.enqueue([&, buf_upload, next_seed]() {
                     const auto t0 = Clock::now();
-                    data.sample_batch(cfg.batch, cfg.seq_len, next_seed, inputs_next, targets_next);
+                    if (use_pinned_tokens) {
+                        data.sample_batch_packed(cfg.batch, cfg.seq_len, next_seed,
+                                                 h_inputs_pinned[buf_upload], h_targets_pinned[buf_upload]);
+                    } else {
+                        data.sample_batch(cfg.batch, cfg.seq_len, next_seed, inputs_next, targets_next);
+                    }
                     next_sample_s = seconds_since(t0);
                     for (size_t di = 0; di < models.size(); ++di) {
                         cuda_check(cudaSetDevice(models[di]->device()), "cudaSetDevice prefetch_upload");
-                        models[di]->upload_tokens_async(inputs_next, targets_next, buf_upload);
+                        if (use_pinned_tokens) {
+                            models[di]->upload_tokens_async_packed(h_inputs_pinned[buf_upload],
+                                                                   h_targets_pinned[buf_upload],
+                                                                   buf_upload);
+                        } else {
+                            models[di]->upload_tokens_async(inputs_next, targets_next, buf_upload);
+                        }
                     }
                     next_uploaded = true;
                 });
@@ -4836,7 +4911,13 @@ int main(int argc, char** argv) {
                 if (!cur_uploaded) {
                     for (size_t di = 0; di < models.size(); ++di) {
                         cuda_check(cudaSetDevice(models[di]->device()), "cudaSetDevice upload_tokens");
-                        models[di]->upload_tokens_async(inputs_cur, targets_cur, buf_cur);
+                        if (use_pinned_tokens) {
+                            models[di]->upload_tokens_async_packed(h_inputs_pinned[buf_cur],
+                                                                   h_targets_pinned[buf_cur],
+                                                                   buf_cur);
+                        } else {
+                            models[di]->upload_tokens_async(inputs_cur, targets_cur, buf_cur);
+                        }
                     }
                 }
                 for (size_t di = 0; di < models.size(); ++di) {
@@ -5206,8 +5287,10 @@ int main(int argc, char** argv) {
 
             if (prefetch_active) {
                 prefetch_future.get();
-                inputs_cur.swap(inputs_next);
-                targets_cur.swap(targets_next);
+                if (!use_pinned_tokens) {
+                    inputs_cur.swap(inputs_next);
+                    targets_cur.swap(targets_next);
+                }
                 cur_sample_s = next_sample_s;
                 buf_cur = buf_next;
                 buf_next = 1 - buf_cur;
@@ -5257,6 +5340,10 @@ int main(int argc, char** argv) {
                     gpu_update_free_matrix(dev, gu.ff2[l]);
                 }
             }
+        }
+        for (int i = 0; i < kTokenBuffers; ++i) {
+            if (h_inputs_pinned[i]) cudaFreeHost(h_inputs_pinned[i]);
+            if (h_targets_pinned[i]) cudaFreeHost(h_targets_pinned[i]);
         }
         if (h_pair_weights) {
             cudaFreeHost(h_pair_weights);

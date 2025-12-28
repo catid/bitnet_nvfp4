@@ -36,3 +36,19 @@ void ByteDataset::sample_batch(int batch, int seq_len, uint64_t seed,
     }
 }
 
+void ByteDataset::sample_batch_packed(int batch, int seq_len, uint64_t seed,
+                                      uint8_t* inputs,
+                                      uint8_t* targets) const {
+    if (!inputs || !targets) return;
+    uint64_t st = seed;
+    for (int b = 0; b < batch; ++b) {
+        uint64_t r = rng::splitmix64(st);
+        size_t start = static_cast<size_t>(r % (data_.size() - seq_len - 1));
+        uint8_t* in_row = inputs + static_cast<size_t>(b) * seq_len;
+        uint8_t* tgt_row = targets + static_cast<size_t>(b) * seq_len;
+        for (int t = 0; t < seq_len; ++t) {
+            in_row[t] = data_[start + t];
+            tgt_row[t] = data_[start + t + 1];
+        }
+    }
+}
