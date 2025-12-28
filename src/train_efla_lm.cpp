@@ -226,10 +226,10 @@ struct TrainConfig {
     bool noise_batch = true;
     bool use_pinned_tokens = true;
 
-    float update_threshold = 0.05f;
-    float update_threshold_end = 0.01f;
+    float update_threshold = 0.008f;
+    float update_threshold_end = 0.008f;
 
-    float lr = 0.30f;     // optimizer lr / step size
+    float lr = 0.80f;     // optimizer lr / step size
     float lr_end = 0.05f; // optional schedule target
 
     float act_scale = 0.8f; // applied after GELU before quantize
@@ -274,7 +274,7 @@ struct TrainConfig {
     bool nvfp4_tune_splits = false;
 
     enum class Schedule { Constant = 0, Linear = 1, Cosine = 2, Exp = 3 };
-    Schedule lr_schedule = Schedule::Exp;
+    Schedule lr_schedule = Schedule::Cosine;
     Schedule thresh_schedule = Schedule::Exp;
     Schedule sigma_schedule = Schedule::Exp;
 
@@ -4519,8 +4519,8 @@ int main(int argc, char** argv) {
                 "  --layers L         number of EFLA blocks (default 4)\n"
                 "  --mlp_mult M       MLP expansion ratio (default 2)\n"
                 "  --model_8m         preset ~8M params (hidden=416, layers=4, mlp_mult=4)\n"
-                "                    + tuned defaults if not overridden: lr=0.30, thresh=0.05,\n"
-                "                      thresh_end=0.01, sigma_shift=3->4, schedules=exp,\n"
+                "                    + tuned defaults if not overridden: lr=0.80, thresh=0.008,\n"
+                "                      thresh_end=0.008, sigma_shift=3->4, lr_schedule=cosine,\n"
                 "                      act_scale=0.8, mlp_act_scale=1.0, lr_end=0.05\n"
                 "  --sigma_shift S    noise scale 1/2^S (default 3)\n"
                 "  --sigma_shift_end S end sigma_shift (default 4)\n"
@@ -4590,12 +4590,12 @@ int main(int argc, char** argv) {
                 "  --clt/--no_clt     use CLT/approx-Gaussian noise (default on)\n"
                 "  --clt_k K          CLT sum terms (default 4)\n"
                 "  --omp_threads N    set OpenMP thread count (default 0 = auto/all cores)\n"
-                "  --thresh T         update threshold (default 0.05)\n"
-                "  --thresh_end T     end threshold (default 0.01)\n"
+                "  --thresh T         update threshold (default 0.008)\n"
+                "  --thresh_end T     end threshold (default 0.008)\n"
                 "  --thresh_schedule {constant|linear|cosine|exp} (default exp)\n"
-                "  --lr LR            optimizer lr / step size (default 0.30)\n"
+                "  --lr LR            optimizer lr / step size (default 0.80)\n"
                 "  --lr_end LR        end lr (default 0.05)\n"
-                "  --lr_schedule {constant|linear|cosine|exp} (default exp)\n"
+                "  --lr_schedule {constant|linear|cosine|exp} (default cosine)\n"
                 "  --fitness {sign|zscore|centered_rank}\n"
                 "  --fitness_clip C   clip for zscore/rank (default 3)\n"
                 "  --shadow/--no_shadow    float shadow weights (default on)\n"
@@ -4690,10 +4690,10 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (model_8m_requested) {
-        if (!lr_specified) cfg.lr = 0.30f;
+        if (!lr_specified) cfg.lr = 0.80f;
         if (!lr_end_specified) cfg.lr_end = 0.05f;
-        if (!lr_schedule_specified) cfg.lr_schedule = TrainConfig::Schedule::Exp;
-        if (!thresh_specified) cfg.update_threshold = 0.05f;
+        if (!lr_schedule_specified) cfg.lr_schedule = TrainConfig::Schedule::Cosine;
+        if (!thresh_specified) cfg.update_threshold = 0.008f;
         if (!sigma_specified) cfg.sigma_shift = 3;
         if (!act_scale_specified) cfg.act_scale = 0.8f;
         if (!mlp_act_scale_specified) cfg.mlp_act_scale = 1.0f;

@@ -28,7 +28,7 @@ Defaults are tuned for throughput:
 - all GPUs by default
 - `gpu_workers=32` (best total throughput on the current setup)
 - `pop=2048, batch=32, seq=128, hidden=512, layers=4, mlp_mult=2`
-- Tuned training defaults: `lr=0.30→0.05`, `thresh=0.05→0.01`, `sigma_shift=3→4` (exp schedules), `train_pos=on`, `act_scale=0.8`
+- Tuned training defaults: `lr=0.80→0.05` (cosine), `thresh=0.008→0.008` (constant), `sigma_shift=3→4` (exp), `train_pos=on`, `act_scale=0.8`
 - NVFP4 defaults: cooperative schedule, 2 stages, split‑K decomp, splits=2, autotune off
 - CUDA graph capture off, fused EFLA step off
 
