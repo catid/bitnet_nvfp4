@@ -187,7 +187,8 @@ struct TrainConfig {
     std::string data_path = "data/tinyshakespeare.txt";
     int device = 0;
     std::vector<int> devices; // optional multi-GPU device list
-    int gpu_workers = 32; // workers per GPU device
+    int gpu_workers = 6; // workers per GPU device
+    int update_streams = 2; // concurrent GPU update streams per device
     int epochs = 50;
     int population = 2048; // even
     int batch = 32;
@@ -261,11 +262,11 @@ struct TrainConfig {
 
     enum class GemmBackend { Dp4a = 0, Cutlass = 1, CutlassNvfp4 = 2 };
     GemmBackend gemm_backend = GemmBackend::CutlassNvfp4;
-    bitnet_cuda::Nvfp4Schedule nvfp4_schedule = bitnet_cuda::Nvfp4Schedule::Cooperative;
+    bitnet_cuda::Nvfp4Schedule nvfp4_schedule = bitnet_cuda::Nvfp4Schedule::Pingpong;
     bitnet_cuda::Nvfp4QuantMode nvfp4_quant_mode = bitnet_cuda::Nvfp4QuantMode::Warp16;
     bitnet_cuda::Nvfp4StageCount nvfp4_stage_count = bitnet_cuda::Nvfp4StageCount::Stages2;
     bitnet_cuda::Nvfp4Decomposition nvfp4_decomp = bitnet_cuda::Nvfp4Decomposition::SplitK;
-    int nvfp4_splits = 2;
+    int nvfp4_splits = 4;
     bool nvfp4_autotune = false;
     bool nvfp4_tune_schedule = false;
     bool nvfp4_tune_quant = false;
@@ -1386,13 +1387,23 @@ public:
         pack_i2_weights(d_head_, V_, H_, d_head_packed_);
     }
 
-    void quantize_nvfp4_base_weights() {
+    void quantize_nvfp4_base_weights_range(int layer_begin,
+                                           int layer_end,
+                                           bool include_emb,
+                                           bool include_win,
+                                           bool include_head) {
         if (!use_nvfp4_) return;
-        bitnet_cuda::nvfp4_quantize_b(d_emb_w_, B_, V_, H_, H_,
-                                      d_emb_nvfp4_, d_emb_sfb_, stream_);
-        bitnet_cuda::nvfp4_quantize_b(d_win_, B_, H_, H_, H_,
-                                      d_win_nvfp4_, d_win_sfb_, stream_);
-        for (int l = 0; l < L_; ++l) {
+        if (include_emb) {
+            bitnet_cuda::nvfp4_quantize_b(d_emb_w_, B_, V_, H_, H_,
+                                          d_emb_nvfp4_, d_emb_sfb_, stream_);
+        }
+        if (include_win) {
+            bitnet_cuda::nvfp4_quantize_b(d_win_, B_, H_, H_, H_,
+                                          d_win_nvfp4_, d_win_sfb_, stream_);
+        }
+        int lb = std::max(0, layer_begin);
+        int le = std::min(L_, layer_end);
+        for (int l = lb; l < le; ++l) {
             const size_t off_hh = static_cast<size_t>(l) * static_cast<size_t>(H_) * static_cast<size_t>(H_);
             const size_t off_h = static_cast<size_t>(l) * static_cast<size_t>(H_);
             const size_t off_hf = static_cast<size_t>(l) * static_cast<size_t>(H_) * static_cast<size_t>(F_);
@@ -1430,8 +1441,14 @@ public:
                                           d_ff2_nvfp4_[static_cast<size_t>(l)],
                                           d_ff2_sfb_[static_cast<size_t>(l)], stream_);
         }
-        bitnet_cuda::nvfp4_quantize_b(d_head_, B_, V_, H_, H_,
-                                      d_head_nvfp4_, d_head_sfb_, stream_);
+        if (include_head) {
+            bitnet_cuda::nvfp4_quantize_b(d_head_, B_, V_, H_, H_,
+                                          d_head_nvfp4_, d_head_sfb_, stream_);
+        }
+    }
+
+    void quantize_nvfp4_base_weights() {
+        quantize_nvfp4_base_weights_range(0, L_, true, true, true);
     }
 
     void quantize_nvfp4_noise_weights() {
@@ -4176,7 +4193,9 @@ struct GpuMatrixState {
 };
 
 struct GpuUpdateDevice {
-    GpuUpdateBuffers buf;
+    std::vector<GpuUpdateBuffers> bufs;
+    std::vector<cudaEvent_t> stream_events;
+    int stream_count = 1;
     GpuMatrixState emb;
     GpuMatrixState win;
     GpuMatrixState head;
@@ -4360,6 +4379,8 @@ int main(int argc, char** argv) {
             devices_specified = true;
         } else if (a == "--gpu_workers") {
             cfg.gpu_workers = std::max(1, std::stoi(next(i)));
+        } else if (a == "--update_streams") {
+            cfg.update_streams = std::max(1, std::stoi(next(i)));
         }
         else if (a == "--epochs") cfg.epochs = std::stoi(next(i));
         else if (a == "--pop") cfg.population = std::stoi(next(i));
@@ -4509,7 +4530,8 @@ int main(int argc, char** argv) {
                 "  --data PATH        byte-level training file (default data/tinyshakespeare.txt)\n"
                 "  --device N         single CUDA device (overrides default all GPUs)\n"
                 "  --devices LIST     comma-separated CUDA devices for data-parallel eval (default: all GPUs)\n"
-                "  --gpu_workers N    workers per GPU device (default 32)\n"
+                "  --gpu_workers N    workers per GPU device (default 6)\n"
+                "  --update_streams N concurrent GPU update streams per device (default 2)\n"
                 "  --method efla|DeltaNet\n"
                 "  --epochs N         epochs (default 50)\n"
                 "  --pop N            ES population (even, default 2048)\n"
@@ -4564,11 +4586,11 @@ int main(int argc, char** argv) {
                 "  --gemm_backend {dp4a|cutlass|nvfp4} (default nvfp4)\n"
                 "  --cutlass_gemm   use CUTLASS GEMM (unpacked only)\n"
                 "  --cutlass_nvfp4  use CUTLASS NVFP4 block-scaled GEMM (sm120+, hidden%128==0)\n"
-                "  --nvfp4_schedule {auto|cooperative|pingpong} (default cooperative)\n"
+                "  --nvfp4_schedule {auto|cooperative|pingpong} (default pingpong)\n"
                 "  --nvfp4_quant {warp16|warp4} (default warp16)\n"
                 "  --nvfp4_stages {auto|2|3|4} (default 2)\n"
                 "  --nvfp4_decomp {auto|data|splitk|streamk} (default splitk)\n"
-                "  --nvfp4_splits N  split-K factor for nvfp4 (default 2)\n"
+                "  --nvfp4_splits N  split-K factor for nvfp4 (default 4)\n"
                 "  --nvfp4_autotune enable nvfp4 tuning for unset options (default off)\n"
                 "  --no_nvfp4_autotune disable nvfp4 tuning\n"
                 "  --efla_fused      use single-kernel EFLA step (default off)\n"
@@ -4763,8 +4785,8 @@ int main(int argc, char** argv) {
             cfg.nvfp4_decomp = bitnet_cuda::Nvfp4Decomposition::SplitK;
             set_decomp = true;
         }
-        if (!nvfp4_splits_specified && cfg.nvfp4_splits != 2) {
-            cfg.nvfp4_splits = 2;
+        if (!nvfp4_splits_specified && cfg.nvfp4_splits != 4) {
+            cfg.nvfp4_splits = 4;
             set_splits = true;
         }
         if (!nvfp4_autotune_specified && cfg.nvfp4_autotune) {
@@ -4783,7 +4805,7 @@ int main(int argc, char** argv) {
                 first = false;
             }
             if (set_splits) {
-                std::cerr << (first ? " " : ", ") << "splits=2";
+                std::cerr << (first ? " " : ", ") << "splits=4";
                 first = false;
             }
             if (set_graph) {
@@ -4889,6 +4911,9 @@ int main(int argc, char** argv) {
         }
         if (cfg.gpu_workers > 1) {
             std::cout << "Workers per device: " << cfg.gpu_workers << "\n";
+        }
+        if (cfg.update_streams > 1) {
+            std::cout << "Update streams per device: " << cfg.update_streams << "\n";
         }
         std::vector<std::shared_ptr<DeviceWeights>> device_weights;
         device_weights.reserve(devices.size());
@@ -5100,7 +5125,17 @@ int main(int argc, char** argv) {
                 gu.ff2.resize(static_cast<size_t>(cfg.layers));
 
                 CudaEflaLm& leader = *models[leader_idx];
-                gpu_update_ensure_buffers(leader, gu.buf, max_n, pairs);
+                const int available_streams = static_cast<int>(device_model_indices[di].size());
+                gu.stream_count = std::max(1, std::min(cfg.update_streams, available_streams));
+                gu.bufs.resize(static_cast<size_t>(gu.stream_count));
+                gu.stream_events.resize(static_cast<size_t>(gu.stream_count), nullptr);
+                for (int si = 0; si < gu.stream_count; ++si) {
+                    gpu_update_ensure_buffers(leader, gu.bufs[static_cast<size_t>(si)], max_n, pairs);
+                    cuda_check(cudaSetDevice(leader.device()), "cudaSetDevice update_stream_event");
+                    cuda_check(cudaEventCreateWithFlags(&gu.stream_events[static_cast<size_t>(si)],
+                                                        cudaEventDisableTiming),
+                               "cudaEventCreate update_stream_event");
+                }
                 gpu_update_alloc_shadow(leader, gu.emb, emb_size);
                 gpu_update_alloc_shadow(leader, gu.win, hh_size);
                 gpu_update_alloc_shadow(leader, gu.head, head_size);
@@ -5419,16 +5454,55 @@ int main(int argc, char** argv) {
                     GpuUpdateDevice& gu = gpu_updates[dev_idx];
                     const bool use_packed = worker.use_packed_gemm();
 
-                    gpu_update_upload_pair_weights(worker, gu.buf, h_pair_weights ? h_pair_weights : weights.data(), pairs);
-                    gpu_update_fill_pair_seeds(worker, gu.buf, cfg.seed,
-                                               static_cast<uint64_t>(epoch), pairs);
+                    const int stream_count = std::max(1, gu.stream_count);
+                    std::vector<CudaEflaLm*> update_models;
+                    update_models.reserve(static_cast<size_t>(stream_count));
+                    for (int si = 0; si < stream_count; ++si) {
+                        const size_t mi = device_model_indices[dev_idx][static_cast<size_t>(si)];
+                        update_models.push_back(models[mi].get());
+                    }
 
-                    gpu_update_matrix(worker, gu.buf, gu.emb, cfg, kSaltEmb,
-                                      lr_t, thresh_t, worker.d_emb_w(), emb_size, pairs,
-                                      nullptr);
-                    gpu_update_matrix(worker, gu.buf, gu.win, cfg, kSaltWin,
-                                      lr_t, thresh_t, worker.d_win_w(), hh_size, pairs,
-                                      use_packed ? worker.d_win_packed() : nullptr);
+                    for (int si = 0; si < stream_count; ++si) {
+                        CudaEflaLm& upd = *update_models[static_cast<size_t>(si)];
+                        gpu_update_upload_pair_weights(upd,
+                                                       gu.bufs[static_cast<size_t>(si)],
+                                                       h_pair_weights ? h_pair_weights : weights.data(),
+                                                       pairs);
+                        gpu_update_fill_pair_seeds(upd,
+                                                   gu.bufs[static_cast<size_t>(si)],
+                                                   cfg.seed,
+                                                   static_cast<uint64_t>(epoch),
+                                                   pairs);
+                    }
+
+                    int stream_idx = 0;
+                    auto next_stream = [&]() -> int {
+                        const int idx = stream_idx;
+                        stream_idx = (stream_idx + 1) % stream_count;
+                        return idx;
+                    };
+                    auto run_update = [&](GpuMatrixState& st,
+                                          uint64_t salt,
+                                          int8_t* d_w,
+                                          size_t n,
+                                          uint32_t* d_w_packed) {
+                        const int si = next_stream();
+                        gpu_update_matrix(*update_models[static_cast<size_t>(si)],
+                                          gu.bufs[static_cast<size_t>(si)],
+                                          st,
+                                          cfg,
+                                          salt,
+                                          lr_t,
+                                          thresh_t,
+                                          d_w,
+                                          n,
+                                          pairs,
+                                          d_w_packed);
+                    };
+
+                    run_update(gu.emb, kSaltEmb, worker.d_emb_w(), emb_size, nullptr);
+                    run_update(gu.win, kSaltWin, worker.d_win_w(), hh_size,
+                               use_packed ? worker.d_win_packed() : nullptr);
                     for (int l = 0; l < cfg.layers; ++l) {
                         const uint64_t lq = layer_salt_wq[static_cast<size_t>(l)];
                         const uint64_t lk = layer_salt_wk[static_cast<size_t>(l)];
@@ -5443,38 +5517,69 @@ int main(int argc, char** argv) {
                         const size_t off_h_p = static_cast<size_t>(l) * h_pack;
                         const size_t off_hf1_p = static_cast<size_t>(l) * hf1_pack;
                         const size_t off_hf2_p = static_cast<size_t>(l) * hf2_pack;
-                        gpu_update_matrix(worker, gu.buf, gu.wq[static_cast<size_t>(l)],
-                                          cfg, lq,
-                                          lr_t, thresh_t, worker.d_wq_w() + off_hh, hh_size, pairs,
-                                          use_packed ? (worker.d_wq_packed() + off_hh_p) : nullptr);
-                        gpu_update_matrix(worker, gu.buf, gu.wk[static_cast<size_t>(l)],
-                                          cfg, lk,
-                                          lr_t, thresh_t, worker.d_wk_w() + off_hh, hh_size, pairs,
-                                          use_packed ? (worker.d_wk_packed() + off_hh_p) : nullptr);
-                        gpu_update_matrix(worker, gu.buf, gu.wv[static_cast<size_t>(l)],
-                                          cfg, lv,
-                                          lr_t, thresh_t, worker.d_wv_w() + off_hh, hh_size, pairs,
-                                          use_packed ? (worker.d_wv_packed() + off_hh_p) : nullptr);
-                        gpu_update_matrix(worker, gu.buf, gu.wbeta[static_cast<size_t>(l)],
-                                          cfg, lb,
-                                          lr_t, thresh_t, worker.d_wbeta_w() + off_h, h_size, pairs,
-                                          use_packed ? (worker.d_wbeta_packed() + off_h_p) : nullptr);
-                        gpu_update_matrix(worker, gu.buf, gu.ff1[static_cast<size_t>(l)],
-                                          cfg, lff1,
-                                          lr_t, thresh_t, worker.d_ff1_w() + off_hf, hf_size, pairs,
-                                          use_packed ? (worker.d_ff1_packed() + off_hf1_p) : nullptr);
-                        gpu_update_matrix(worker, gu.buf, gu.ff2[static_cast<size_t>(l)],
-                                          cfg, lff2,
-                                          lr_t, thresh_t, worker.d_ff2_w() + off_hf, hf_size, pairs,
-                                          use_packed ? (worker.d_ff2_packed() + off_hf2_p) : nullptr);
+                        run_update(gu.wq[static_cast<size_t>(l)],
+                                   lq,
+                                   worker.d_wq_w() + off_hh,
+                                   hh_size,
+                                   use_packed ? (worker.d_wq_packed() + off_hh_p) : nullptr);
+                        run_update(gu.wk[static_cast<size_t>(l)],
+                                   lk,
+                                   worker.d_wk_w() + off_hh,
+                                   hh_size,
+                                   use_packed ? (worker.d_wk_packed() + off_hh_p) : nullptr);
+                        run_update(gu.wv[static_cast<size_t>(l)],
+                                   lv,
+                                   worker.d_wv_w() + off_hh,
+                                   hh_size,
+                                   use_packed ? (worker.d_wv_packed() + off_hh_p) : nullptr);
+                        run_update(gu.wbeta[static_cast<size_t>(l)],
+                                   lb,
+                                   worker.d_wbeta_w() + off_h,
+                                   h_size,
+                                   use_packed ? (worker.d_wbeta_packed() + off_h_p) : nullptr);
+                        run_update(gu.ff1[static_cast<size_t>(l)],
+                                   lff1,
+                                   worker.d_ff1_w() + off_hf,
+                                   hf_size,
+                                   use_packed ? (worker.d_ff1_packed() + off_hf1_p) : nullptr);
+                        run_update(gu.ff2[static_cast<size_t>(l)],
+                                   lff2,
+                                   worker.d_ff2_w() + off_hf,
+                                   hf_size,
+                                   use_packed ? (worker.d_ff2_packed() + off_hf2_p) : nullptr);
                     }
-                    gpu_update_matrix(worker, gu.buf, gu.head, cfg, kSaltHead,
-                                      lr_t, thresh_t, worker.d_head_w(), head_size, pairs,
-                                      use_packed ? worker.d_head_packed() : nullptr);
+                    run_update(gu.head, kSaltHead, worker.d_head_w(), head_size,
+                               use_packed ? worker.d_head_packed() : nullptr);
+
+                    if (stream_count > 1) {
+                        const int layers = cfg.layers;
+                        const int per_stream = (layers + stream_count - 1) / stream_count;
+                        for (int si = 0; si < stream_count; ++si) {
+                            const int l0 = si * per_stream;
+                            const int l1 = std::min(layers, l0 + per_stream);
+                            const bool include_emb = (si == 0);
+                            const bool include_win = (si == 0);
+                            const bool include_head = (si == 0);
+                            update_models[static_cast<size_t>(si)]->quantize_nvfp4_base_weights_range(
+                                l0, l1, include_emb, include_win, include_head);
+                        }
+                    }
+
+                    for (int si = 0; si < stream_count; ++si) {
+                        cuda_check(cudaEventRecord(gu.stream_events[static_cast<size_t>(si)],
+                                                   update_models[static_cast<size_t>(si)]->stream()),
+                                   "cudaEventRecord update_stream_done");
+                        cuda_check(cudaStreamWaitEvent(worker.stream(),
+                                                       gu.stream_events[static_cast<size_t>(si)],
+                                                       0),
+                                   "cudaStreamWaitEvent update_stream_done");
+                    }
                     if (use_packed && !cfg.use_packed_update) {
                         worker.pack_base_weights();
                     }
-                    worker.quantize_nvfp4_base_weights();
+                    if (stream_count == 1) {
+                        worker.quantize_nvfp4_base_weights();
+                    }
                     cuda_check(cudaEventRecord(update_done_events[dev_idx], worker.stream()),
                                "cudaEventRecord update_done");
                     for (size_t mi : device_model_indices[dev_idx]) {
@@ -5655,7 +5760,14 @@ int main(int argc, char** argv) {
                 const size_t leader_idx = device_model_indices[di][0];
                 const int dev = models[leader_idx]->device();
                 GpuUpdateDevice& gu = gpu_updates[di];
-                gpu_update_free_buffers(dev, gu.buf);
+                for (auto& buf : gu.bufs) {
+                    gpu_update_free_buffers(dev, buf);
+                }
+                for (cudaEvent_t ev : gu.stream_events) {
+                    if (!ev) continue;
+                    cuda_check(cudaSetDevice(dev), "cudaSetDevice destroy update_stream_event");
+                    cudaEventDestroy(ev);
+                }
                 gpu_update_free_matrix(dev, gu.emb);
                 gpu_update_free_matrix(dev, gu.win);
                 gpu_update_free_matrix(dev, gu.head);
