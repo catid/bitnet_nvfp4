@@ -4957,14 +4957,18 @@ int main(int argc, char** argv) {
                         data.sample_batch(cfg.batch, cfg.seq_len, next_seed, inputs_next, targets_next);
                     }
                     next_sample_s = seconds_since(t0);
-                    for (size_t di = 0; di < models.size(); ++di) {
-                        cuda_check(cudaSetDevice(models[di]->device()), "cudaSetDevice prefetch_upload");
-                        if (use_pinned_tokens) {
-                            models[di]->upload_tokens_async_packed(h_inputs_pinned[buf_upload],
-                                                                   h_targets_pinned[buf_upload],
-                                                                   buf_upload);
-                        } else {
-                            models[di]->upload_tokens_async(inputs_next, targets_next, buf_upload);
+                    for (size_t dev_idx = 0; dev_idx < device_model_indices.size(); ++dev_idx) {
+                        if (device_model_indices[dev_idx].empty()) continue;
+                        const size_t leader_idx = device_model_indices[dev_idx][0];
+                        cuda_check(cudaSetDevice(models[leader_idx]->device()), "cudaSetDevice prefetch_upload");
+                        for (size_t mi : device_model_indices[dev_idx]) {
+                            if (use_pinned_tokens) {
+                                models[mi]->upload_tokens_async_packed(h_inputs_pinned[buf_upload],
+                                                                       h_targets_pinned[buf_upload],
+                                                                       buf_upload);
+                            } else {
+                                models[mi]->upload_tokens_async(inputs_next, targets_next, buf_upload);
+                            }
                         }
                     }
                     next_uploaded = true;
@@ -4975,20 +4979,28 @@ int main(int argc, char** argv) {
                 NvtxRange range_upload(cfg.use_nvtx, "upload_tokens");
                 const auto t0 = Clock::now();
                 if (!cur_uploaded) {
-                    for (size_t di = 0; di < models.size(); ++di) {
-                        cuda_check(cudaSetDevice(models[di]->device()), "cudaSetDevice upload_tokens");
-                        if (use_pinned_tokens) {
-                            models[di]->upload_tokens_async_packed(h_inputs_pinned[buf_cur],
-                                                                   h_targets_pinned[buf_cur],
-                                                                   buf_cur);
-                        } else {
-                            models[di]->upload_tokens_async(inputs_cur, targets_cur, buf_cur);
+                    for (size_t dev_idx = 0; dev_idx < device_model_indices.size(); ++dev_idx) {
+                        if (device_model_indices[dev_idx].empty()) continue;
+                        const size_t leader_idx = device_model_indices[dev_idx][0];
+                        cuda_check(cudaSetDevice(models[leader_idx]->device()), "cudaSetDevice upload_tokens");
+                        for (size_t mi : device_model_indices[dev_idx]) {
+                            if (use_pinned_tokens) {
+                                models[mi]->upload_tokens_async_packed(h_inputs_pinned[buf_cur],
+                                                                       h_targets_pinned[buf_cur],
+                                                                       buf_cur);
+                            } else {
+                                models[mi]->upload_tokens_async(inputs_cur, targets_cur, buf_cur);
+                            }
                         }
                     }
                 }
-                for (size_t di = 0; di < models.size(); ++di) {
-                    cuda_check(cudaSetDevice(models[di]->device()), "cudaSetDevice set_active_tokens");
-                    models[di]->set_active_tokens(buf_cur);
+                for (size_t dev_idx = 0; dev_idx < device_model_indices.size(); ++dev_idx) {
+                    if (device_model_indices[dev_idx].empty()) continue;
+                    const size_t leader_idx = device_model_indices[dev_idx][0];
+                    cuda_check(cudaSetDevice(models[leader_idx]->device()), "cudaSetDevice set_active_tokens");
+                    for (size_t mi : device_model_indices[dev_idx]) {
+                        models[mi]->set_active_tokens(buf_cur);
+                    }
                 }
                 upload_s = seconds_since(t0);
                 cur_uploaded = true;
