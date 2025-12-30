@@ -19,6 +19,8 @@
 - [ ] Profile multi-worker scheduling vs. CUDA MPS or CUDA graphs per worker.
 - [ ] Fuse remaining memory-bound steps (noise add, residual add, norm) into GEMM epilogues.
 - [ ] Compare against Microsoft BitNet kernels for further GEMM/layout ideas.
+- [ ] Multi-GPU scaling: reduce serial overhead (train/val loss eval, update/logging).
+  - [x] Experiment: split train_loss across devices by batch slicing (loss slices per GPU). No speedup with gpu_workers=32 (speedup ~3.71x vs ~3.84x baseline); reverted.
 
 ## NVFP4 throughput focus (in progress)
 - [x] Fuse MLP residual add + abs-mean norm in NVFP4 path and reuse the normalized output for the next layer (skip per-layer absmean_norm_q_nvfp4). (~+4% tok/s in 5-epoch sanity run)
@@ -49,7 +51,7 @@
   - [ ] Experiment: batched GEMV/GEMM alternative.
 - [ ] EFLA prepare + diff (~8.6% total): reduce kernel count.
   - [ ] Experiment: fuse prepare with kS (compute q_norm/k_usage on the fly).
-  - [ ] Experiment: warp-reduction kS for H=512 (tile_d=32), using warp shuffles to sum across z-tiles and write once per n (removes atomics for half2 path).
+  - [x] Experiment: block-level reduction kS for H=512 (blockDim.y=4, grid_z=1) (avg tok/s_total ~970k vs ~966k baseline; regressed vs kS shared; reverted).
   - [ ] Experiment: fuse diff into update (H=512 tuned).
 - [ ] NVFP4 absmean_norm_q_nvfp4 (~11.1%) + add_scaled_to_int8_absmean_norm_q_nvfp4 (~10.9%).
   - [ ] Experiment: ensure all residual paths use the fused add+norm kernel (eliminate standalone absmean_norm where possible).
@@ -79,5 +81,8 @@
   - [x] Experiment: fuse add_pos + GELU + quantize into a single kernel. (avg tok/s_total ~967k vs ~950k baseline; kept).
 - [ ] CUDA API overhead (launch + memset + sync).
   - [x] Experiment: replace per-step cudaMemsetAsync for EFLA kS/out with a single zero kernel (avg tok/s_total ~978k vs ~967k baseline; kept).
+  - [x] Experiment: cache head_bias on device and reuse in evaluate_loss (skip per-call H2D copy). 1 GPU avg tok/s_total ~262k vs ~248k baseline; 4 GPU ~974k vs ~951k; kept.
+  - [x] Experiment: CUDA graph for train/val loss only (via --cuda_graph) (regressed: 1 GPU ~257k vs ~262k; 4 GPU ~945k vs ~974k; reverted).
+  - [x] Experiment: async metrics pipeline (overlap train/val loss with next epoch eval in fixed_train) (regressed: 1 GPU ~227k vs ~262k; 4 GPU ~795k vs ~974k; reverted).
   - [ ] Experiment: remove cudaStreamSynchronize in NVFP4 paths (events instead).
   - [ ] Experiment: re-test CUDA graph capture for specific subsets only.

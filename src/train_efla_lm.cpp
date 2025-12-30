@@ -2103,6 +2103,17 @@ public:
     uint32_t* d_head_packed() const { return d_head_packed_; }
     bool use_packed_gemm() const { return use_packed_gemm_; }
 
+    void set_head_bias(const float* head_bias) {
+        if (!head_bias) {
+            head_bias_cached_ = false;
+            return;
+        }
+        cuda_check(cudaMemcpyAsync(d_head_bias_, head_bias, static_cast<size_t>(V_) * sizeof(float),
+                                   cudaMemcpyHostToDevice, stream_),
+                   "cudaMemcpyAsync head_bias");
+        head_bias_cached_ = true;
+    }
+
     float evaluate_loss(int method,
                         int anti_sign,
                         int sigma_shift,
@@ -2128,9 +2139,9 @@ public:
         const float* d_bias = nullptr;
         const float* d_bias_noise = nullptr;
         if (head_bias) {
-            cuda_check(cudaMemcpyAsync(d_head_bias_, head_bias, static_cast<size_t>(V_) * sizeof(float),
-                                       cudaMemcpyHostToDevice, stream_),
-                       "cudaMemcpyAsync head_bias");
+            set_head_bias(head_bias);
+            d_bias = d_head_bias_;
+        } else if (head_bias_cached_) {
             d_bias = d_head_bias_;
         }
         if (head_bias_noise && bias_noise_scale != 0.0f) {
@@ -3570,6 +3581,7 @@ private:
     float* d_head_bias_noise_ = nullptr;
     float* d_loss_sum_ = nullptr;
     float* h_loss_sum_pinned_ = nullptr;
+    bool head_bias_cached_ = false;
 
     size_t state_bytes_ = 0;
     bool use_fp16_state_ = false;
@@ -5011,6 +5023,11 @@ int main(int argc, char** argv) {
         const int max_pairs = cfg.population / 2;  // max for allocations
         const int method_id = static_cast<int>(cfg.method);
 
+        using Clock = std::chrono::steady_clock;
+        auto seconds_since = [](Clock::time_point start) -> double {
+            return std::chrono::duration<double>(Clock::now() - start).count();
+        };
+
         // Helper to compute adaptive population pairs based on epoch progress
         // Conservative schedule: 50% -> 75% -> 100% to preserve model quality
         auto compute_adaptive_pairs = [&](int epoch) -> int {
@@ -5177,11 +5194,6 @@ int main(int argc, char** argv) {
                 }
             }
         }
-
-        using Clock = std::chrono::steady_clock;
-        auto seconds_since = [](Clock::time_point start) -> double {
-            return std::chrono::duration<double>(Clock::now() - start).count();
-        };
 
         std::vector<std::vector<uint8_t>> inputs_cur, targets_cur;
         std::vector<std::vector<uint8_t>> inputs_next, targets_next;
@@ -5351,6 +5363,8 @@ int main(int argc, char** argv) {
                 std::vector<float>& head_bias_noise = scratch.head_bias_noise;
                 EflaLmWeights& noise = scratch.noise;
 
+                worker.set_head_bias(w.head_bias.data());
+
                 for (int p = start; p < end; ++p) {
                     const uint64_t pair_seed =
                         rng::mix(cfg.seed, rng::mix(static_cast<uint64_t>(epoch), static_cast<uint64_t>(p)));
@@ -5433,7 +5447,7 @@ int main(int argc, char** argv) {
                                                               cfg.residual_scale, cfg.mlp_residual_scale,
                                                               cfg.gate_scale, cfg.state_decay,
                                                               cfg.int8_residual, cfg.absmean_norm,
-                                                              w.head_bias.data(), head_bias_noise.data(),
+                                                              /*head_bias*/nullptr, head_bias_noise.data(),
                                                               w.beta_bias.data(), beta_bias_noise.data());
                     if (cfg.train_pos) {
                         for (size_t i = 0; i < pos.size(); ++i) {
@@ -5447,7 +5461,7 @@ int main(int argc, char** argv) {
                                                               cfg.residual_scale, cfg.mlp_residual_scale,
                                                               cfg.gate_scale, cfg.state_decay,
                                                               cfg.int8_residual, cfg.absmean_norm,
-                                                              w.head_bias.data(), head_bias_noise.data(),
+                                                              /*head_bias*/nullptr, head_bias_noise.data(),
                                                               w.beta_bias.data(), beta_bias_noise.data());
                     weights[static_cast<size_t>(p)] = -(loss_p - loss_m);
                 }
@@ -5698,68 +5712,74 @@ int main(int argc, char** argv) {
             }
             update_s = seconds_since(update_t0);
 
-            float train_loss = 0.0f;
-            {
-                NvtxRange range_train(cfg.use_nvtx, "train_loss_eval");
-                const auto t0 = Clock::now();
-                cuda_check(cudaSetDevice(models[0]->device()), "cudaSetDevice train_loss");
-                train_loss = model.evaluate_loss(method_id, /*anti*/0, sigma_t,
-                                                 cfg.act_scale, cfg.mlp_act_scale,
-                                                 cfg.ln_scale,
-                                                 cfg.residual_scale, cfg.mlp_residual_scale,
-                                                 cfg.gate_scale, cfg.state_decay,
-                                                 cfg.int8_residual, cfg.absmean_norm,
-                                                 w.head_bias.data(), /*head_bias_noise*/nullptr,
-                                                 w.beta_bias.data(), /*beta_bias_noise*/nullptr);
-                train_s = seconds_since(t0);
-            }
-            const float train_ppl = std::exp(train_loss);
-            std::cout << "epoch " << epoch
-                      << " lr " << lr_t
-                      << " thresh " << thresh_t
-                      << " sigma " << sigma_t
-                      << " train_loss " << train_loss
-                      << " train_ppl " << train_ppl;
-
             const bool do_val_epoch = cfg.do_val && cfg.val_every > 0 && (epoch % cfg.val_every) == 0;
-            if (do_val_epoch) {
-                float val_loss = 0.0f;
-                {
-                    NvtxRange range_val(cfg.use_nvtx, "val_eval");
-                    const auto t0 = Clock::now();
-                    std::vector<std::vector<uint8_t>> vin, vtgt;
-                    data.sample_batch(cfg.batch, cfg.seq_len, cfg.val_seed, vin, vtgt);
-                    const int val_buf = cfg.fixed_train ? buf_next : buf_cur;
-                    cuda_check(cudaSetDevice(models[0]->device()), "cudaSetDevice val_upload_tokens");
-                    model.upload_tokens(vin, vtgt, val_buf);
-                    val_loss = model.evaluate_loss(method_id, /*anti*/0, sigma_t,
-                                                   cfg.act_scale, cfg.mlp_act_scale,
-                                                   cfg.ln_scale,
-                                                   cfg.residual_scale, cfg.mlp_residual_scale,
-                                                   cfg.gate_scale, cfg.state_decay,
-                                                   cfg.int8_residual, cfg.absmean_norm,
-                                                   w.head_bias.data(), /*head_bias_noise*/nullptr,
-                                                   w.beta_bias.data(), /*beta_bias_noise*/nullptr);
-                    if (cfg.fixed_train && val_buf != buf_cur) {
-                        model.set_active_tokens(buf_cur);
-                    }
-                    val_s = seconds_since(t0);
-                }
-                const float val_ppl = std::exp(val_loss);
-                std::cout << " val_loss " << val_loss
-                          << " val_ppl " << val_ppl;
-            }
 
-            if (prefetch_active) {
-                prefetch_future.get();
-                if (!use_pinned_tokens) {
-                    inputs_cur.swap(inputs_next);
-                    targets_cur.swap(targets_next);
+            {
+                float train_loss = 0.0f;
+                {
+                    NvtxRange range_train(cfg.use_nvtx, "train_loss_eval");
+                    const auto t0 = Clock::now();
+                    cuda_check(cudaSetDevice(models[0]->device()), "cudaSetDevice train_loss");
+                    model.set_head_bias(w.head_bias.data());
+                    train_loss = model.evaluate_loss(method_id, /*anti*/0, sigma_t,
+                                                     cfg.act_scale, cfg.mlp_act_scale,
+                                                     cfg.ln_scale,
+                                                     cfg.residual_scale, cfg.mlp_residual_scale,
+                                                     cfg.gate_scale, cfg.state_decay,
+                                                     cfg.int8_residual, cfg.absmean_norm,
+                                                     /*head_bias*/nullptr, /*head_bias_noise*/nullptr,
+                                                     w.beta_bias.data(), /*beta_bias_noise*/nullptr);
+                    train_s = seconds_since(t0);
                 }
-                cur_sample_s = next_sample_s;
-                buf_cur = buf_next;
-                buf_next = 1 - buf_cur;
-                cur_uploaded = next_uploaded;
+                const float train_ppl = std::exp(train_loss);
+                std::cout << "epoch " << epoch
+                          << " lr " << lr_t
+                          << " thresh " << thresh_t
+                          << " sigma " << sigma_t
+                          << " train_loss " << train_loss
+                          << " train_ppl " << train_ppl;
+
+                if (do_val_epoch) {
+                    float val_loss = 0.0f;
+                    {
+                        NvtxRange range_val(cfg.use_nvtx, "val_eval");
+                        const auto t0 = Clock::now();
+                        std::vector<std::vector<uint8_t>> vin, vtgt;
+                        data.sample_batch(cfg.batch, cfg.seq_len, cfg.val_seed, vin, vtgt);
+                        const int val_buf = cfg.fixed_train ? buf_next : buf_cur;
+                        cuda_check(cudaSetDevice(models[0]->device()), "cudaSetDevice val_upload_tokens");
+                        model.set_head_bias(w.head_bias.data());
+                        model.upload_tokens(vin, vtgt, val_buf);
+                        val_loss = model.evaluate_loss(method_id, /*anti*/0, sigma_t,
+                                                       cfg.act_scale, cfg.mlp_act_scale,
+                                                       cfg.ln_scale,
+                                                       cfg.residual_scale, cfg.mlp_residual_scale,
+                                                       cfg.gate_scale, cfg.state_decay,
+                                                       cfg.int8_residual, cfg.absmean_norm,
+                                                       /*head_bias*/nullptr, /*head_bias_noise*/nullptr,
+                                                       w.beta_bias.data(), /*beta_bias_noise*/nullptr);
+                        if (cfg.fixed_train && val_buf != buf_cur) {
+                            model.set_active_tokens(buf_cur);
+                        }
+                        val_s = seconds_since(t0);
+                    }
+                    const float val_ppl = std::exp(val_loss);
+                    std::cout << " val_loss " << val_loss
+                              << " val_ppl " << val_ppl;
+                }
+
+                if (prefetch_active) {
+                    prefetch_future.get();
+                    if (!use_pinned_tokens) {
+                        inputs_cur.swap(inputs_next);
+                        targets_cur.swap(targets_next);
+                    }
+                    cur_sample_s = next_sample_s;
+                    buf_cur = buf_next;
+                    buf_next = 1 - buf_cur;
+                    cur_uploaded = next_uploaded;
+                }
+
             }
 
             const double wall_s = seconds_since(epoch_start);
